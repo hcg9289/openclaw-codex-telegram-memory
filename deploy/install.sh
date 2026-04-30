@@ -68,6 +68,7 @@ copy_memory() {
     chmod 0600 "${MEMORY_DIR}/config/memory.env"
     echo "Kept existing ${MEMORY_DIR}/config/memory.env"
   fi
+  ln -sfn "config/memory.env" "${MEMORY_DIR}/.env"
 
   if [[ ! -d "${MEMORY_DIR}/venv" ]]; then
     python3 -m venv "${MEMORY_DIR}/venv"

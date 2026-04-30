@@ -30,6 +30,7 @@ sudo bash deploy/scripts/smoke_check.sh
 ```
 
 The installer keeps existing real env files. It only creates env files from examples when they do not already exist.
+For memory Docker Compose, the installer links `/opt/openclaw-memory/.env` to `/opt/openclaw-memory/config/memory.env` so compose variable interpolation uses the same secret file.
 
 ## Included
 
