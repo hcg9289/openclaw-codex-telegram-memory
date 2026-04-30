@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+APP_DIR = Path(__file__).resolve().parent
+ENV_FILE = APP_DIR / ".env"
+
+
+def load_env_file(path=ENV_FILE):
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def main():
+    load_env_file()
+    sys.path.insert(0, str(APP_DIR))
+
+    import gateway
+    import memory_adapter
+    import task_store
+    import telegram_sender
+
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: task_worker.py <task_id>")
+    task_id = sys.argv[1]
+    task = task_store.get_task(task_id)
+    if not task:
+        raise SystemExit(f"task not found: {task_id}")
+
+    chat_id = task.get("chat_id")
+    user_id = task.get("user_id")
+    user_text = task.get("user_text") or ""
+
+    task_store.update_task(task_id, status="running", started_at=task_store.utc_now(), error=None)
+    task_store.append_event(task_id, "started", {})
+
+    result = ""
+    status = "failed"
+    returncode = None
+    started = time.time()
+    out_path = None
+    try:
+        recent_context = gateway.format_recent_context()
+        recall_query = gateway.build_recall_query(user_text)
+        referenced = task_store.resolve_referenced_task(user_text, exclude_task_id=task_id)
+        if referenced:
+            recall_query += "\n\nReferenced task context:\n" + task_store.task_context(referenced["task_id"], limit_chars=8000)
+        recall_result = memory_adapter.recall_memory(recall_query, session_id=str(chat_id), top_k=5, timeout=45)
+        recall_text = recall_result.get("text") if recall_result.get("ok") else f"(cognee recall failed: {recall_result.get('error')})"
+        gateway.save_last_context(chat_id, user_id, recall_result)
+
+        task_context = task_store.task_context(referenced["task_id"], limit_chars=12000) if referenced else "(no referenced task context)"
+        prompt = gateway.build_prompt(user_text, recall_text, recent_context)
+        prompt += f"""
+
+[STRICT_SCOPE_RULE]
+Do exactly what the user asked.
+Do not expand scope.
+Do not start unrelated work.
+Do not modify files unless the user explicitly asked.
+If the user asks for progress, only inspect and explain progress.
+If the user asks for result, only read and summarize existing result.
+If evidence is insufficient, say so instead of doing extra work.
+[/STRICT_SCOPE_RULE]
+
+[REFERENCED_TASK_CONTEXT]
+{task_context}
+[/REFERENCED_TASK_CONTEXT]
+
+[CURRENT_BACKGROUND_TASK]
+task_id={task_id}
+Write your final Telegram answer as the final response. Do not claim work is complete unless you have evidence.
+[/CURRENT_BACKGROUND_TASK]
+"""
+        task_store.write_task_text(task_id, "prompt.md", prompt)
+
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False) as out_file:
+            out_path = out_file.name
+        cmd = [
+            os.environ.get("CODEX_BIN", "/usr/bin/codex"),
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            out_path,
+            prompt,
+        ]
+        completed = subprocess.run(
+            cmd,
+            cwd=os.environ.get("CODEX_WORKDIR", "/root"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=int(os.environ.get("CODEX_TIMEOUT_SECONDS", "18000")),
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout_text = memory_adapter.redact_secrets(completed.stdout or "")
+        task_store.write_task_text(task_id, "stdout.log", stdout_text)
+        try:
+            answer = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
+        except FileNotFoundError:
+            answer = ""
+        answer = memory_adapter.redact_secrets(answer)
+        if completed.returncode == 0:
+            status = "succeeded"
+            result = answer or stdout_text[-6000:] or "(Codex finished without text output)"
+        else:
+            result = answer or stdout_text[-6000:] or f"Codex failed with exit code {completed.returncode}."
+    except subprocess.TimeoutExpired:
+        status = "failed"
+        result = f"Codex timed out after {os.environ.get('CODEX_TIMEOUT_SECONDS', '18000')} seconds."
+    except Exception as exc:
+        status = "failed"
+        result = f"{type(exc).__name__}: {exc}"
+    finally:
+        if out_path:
+            try:
+                os.unlink(out_path)
+            except FileNotFoundError:
+                pass
+
+    safe_result = memory_adapter.redact_secrets(result)
+    task_store.write_task_text(task_id, "stderr.log", "")
+    task_store.write_task_text(task_id, "result.md", safe_result)
+    task_store.update_task(
+        task_id,
+        status=status,
+        error=None if status == "succeeded" else safe_result[:1000],
+        returncode=returncode,
+        duration_seconds=round(time.time() - started, 2),
+    )
+    task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
+
+    if chat_id:
+        telegram_sender.send_message(chat_id, f"任務完成：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}")
+    gateway.append_recent("assistant", safe_result, chat_id, user_id)
+    if gateway.should_auto_remember(user_text, safe_result):
+        gateway.remember_async(
+            f"Telegram background task:\nUser: {user_text}\nAssistant: {safe_result}",
+            {"source": "telegram_task", "chat_id": chat_id, "user_id": user_id, "task_id": task_id},
+        )
+
+    subprocess.run(
+        [sys.executable, str(APP_DIR / "task_starter.py")],
+        cwd=str(APP_DIR),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
