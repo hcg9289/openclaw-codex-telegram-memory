@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaw Codex Telegram Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/codex-telegram-gateway
+EnvironmentFile=/opt/codex-telegram-gateway/.env
+ExecStart=/usr/bin/python3 /opt/codex-telegram-gateway/gateway.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# The task worker intentionally starts privileged Codex background tasks.
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
