@@ -98,6 +98,32 @@ Progress / result 類問題：
 - 若任務中斷，列出最後更新時間、完成數、PID/unit 狀態、缺少哪個報告，以及下一步補救。
 [/ENGINEERING_OWNER_PROTOCOL]
 
+[TASK_WATCH_CONTRACT]
+If this task starts any background process, overnight job, long scan, backtest, WF, deployment, data download, or any work that will continue after your Codex process exits, you MUST register it for supervision.
+
+Write this JSON file before your final answer:
+/var/lib/codex-telegram-gateway/tasks/{task_id}/watch.json
+
+Schema:
+{{
+  "enabled": true,
+  "kind": "external_process",
+  "summary": "short human-readable description",
+  "pid": 12345,
+  "pid_file": "/absolute/path/to/runner.pid",
+  "progress_file": "/absolute/path/to/progress.json",
+  "heartbeat_file": "/absolute/path/to/heartbeat.json",
+  "log_file": "/absolute/path/to/stdout_or_runner.log",
+  "stderr_file": "/absolute/path/to/stderr_or_error.log",
+  "final_report": "/absolute/path/to/final_report.md",
+  "resume_command": "safe command to resume from checkpoint",
+  "stale_after_seconds": 900
+}}
+
+Only include paths that truly exist or will be created by the runner. Do not include secrets.
+If no long-running/background work is started, do not create watch.json.
+[/TASK_WATCH_CONTRACT]
+
 [REFERENCED_TASK_CONTEXT]
 {task_context}
 [/REFERENCED_TASK_CONTEXT]
@@ -157,6 +183,16 @@ Write your final Telegram answer as the final response. Do not claim work is com
                 pass
 
     safe_result = memory_adapter.redact_secrets(result)
+    watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
+    if status == "succeeded" and isinstance(watch, dict) and watch.get("enabled", False):
+        status = "watching"
+        safe_result = (
+            safe_result.rstrip()
+            + "\n\n[supervisor]\n"
+            + "此 task 已登記 watch.json，將由 codex-telegram-task-supervisor.service 持續監護，直到完成或明確失敗。\n"
+            + "[/supervisor]"
+        )
+        task_store.append_event(task_id, "watch_registered", {"watch": watch})
     task_store.write_task_text(task_id, "stderr.log", "")
     task_store.write_task_text(task_id, "result.md", safe_result)
     task_store.update_task(
@@ -169,7 +205,8 @@ Write your final Telegram answer as the final response. Do not claim work is com
     task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
 
     if chat_id:
-        telegram_sender.send_message(chat_id, f"任務完成：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}")
+        heading = "任務已進入監護" if status == "watching" else "任務完成"
+        telegram_sender.send_message(chat_id, f"{heading}：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}")
     gateway.append_recent("assistant", safe_result, chat_id, user_id)
     if gateway.should_auto_remember(user_text, safe_result):
         gateway.remember_async(

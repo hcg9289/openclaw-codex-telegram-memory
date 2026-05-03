@@ -11,7 +11,7 @@ import memory_adapter
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/codex-telegram-gateway"))
 TASKS_DIR = STATE_DIR / "tasks"
-ACTIVE_STATUSES = {"queued", "starting", "running"}
+ACTIVE_STATUSES = {"queued", "starting", "running", "watching", "needs_attention", "finalizing"}
 FINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 OBSERVE_WORDS = [
     "剛才",
@@ -154,6 +154,22 @@ def read_task_text(task_id, filename, limit_chars=12000):
     return memory_adapter.redact_secrets(path.read_text(encoding="utf-8", errors="replace")[-limit_chars:])
 
 
+def read_events_tail(task_id, limit=20):
+    path = task_dir(task_id) / "events.jsonl"
+    if not path.exists():
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    return memory_adapter.redact_secrets("\n".join(lines))
+
+
+def read_task_json(task_id, filename, default=None):
+    return read_json(task_dir(task_id) / filename, default=default)
+
+
+def write_task_json(task_id, filename, data):
+    write_json(task_dir(task_id) / filename, data)
+
+
 def list_tasks(limit=10, include_system=True):
     if not TASKS_DIR.exists():
         return []
@@ -220,6 +236,18 @@ def task_context(task_id, limit_chars=12000):
         f"updated_at={task.get('updated_at')}",
         f"error={task.get('error')}",
         f"user_text={task.get('user_text')}",
+        "",
+        "[watch_json]",
+        json.dumps(read_task_json(task_id, "watch.json", default={}) or {}, ensure_ascii=False, indent=2),
+        "[/watch_json]",
+        "",
+        "[supervisor_state]",
+        json.dumps(read_task_json(task_id, "supervisor_state.json", default={}) or {}, ensure_ascii=False, indent=2),
+        "[/supervisor_state]",
+        "",
+        "[events_tail]",
+        read_events_tail(task_id, limit=20) or "(empty)",
+        "[/events_tail]",
         "",
         "[stdout_tail]",
         read_task_text(task_id, "stdout.log", limit_chars=4000) or "(empty)",
