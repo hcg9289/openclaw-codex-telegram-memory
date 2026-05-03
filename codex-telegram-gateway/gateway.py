@@ -2,10 +2,12 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -57,6 +59,14 @@ def api_call(method, data=None, timeout=35):
     if not parsed.get("ok"):
         raise RuntimeError(f"Telegram API error on {method}: {parsed}")
     return parsed["result"]
+
+
+def is_polling_timeout(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return "timed out" in str(exc).lower()
 
 
 def send_message(chat_id, text):
@@ -711,12 +721,14 @@ def main():
     print(f"Codex Telegram Gateway started as @{me.get('username')}", flush=True)
 
     offset = read_offset()
+    polling_timeout_count = 0
     while not STOP:
         try:
             params = {"timeout": 30, "allowed_updates": json.dumps(["message"])}
             if offset is not None:
                 params["offset"] = offset
             updates = api_call("getUpdates", params, timeout=40)
+            polling_timeout_count = 0
             for update in updates:
                 update_id = update["update_id"]
                 offset = update_id + 1
@@ -724,6 +736,12 @@ def main():
                 if "message" in update:
                     handle_message(update["message"])
         except Exception as exc:
+            if is_polling_timeout(exc):
+                polling_timeout_count += 1
+                if polling_timeout_count == 1 or polling_timeout_count % 20 == 0:
+                    print(f"gateway polling timeout: retrying count={polling_timeout_count}", flush=True)
+                time.sleep(1)
+                continue
             print(f"gateway error: {exc}", flush=True)
             time.sleep(5)
 
