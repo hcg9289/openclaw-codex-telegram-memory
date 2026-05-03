@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaw Codex Telegram Task Supervisor
+Wants=network-online.target codex-telegram-gateway.service
+After=network-online.target codex-telegram-gateway.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/codex-telegram-gateway
+EnvironmentFile=/opt/codex-telegram-gateway/.env
+ExecStart=/usr/bin/python3 /opt/codex-telegram-gateway/task_supervisor.py
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# The supervisor may launch privileged Codex recovery tasks.
+NoNewPrivileges=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

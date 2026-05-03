@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/opt/codex-telegram-gateway}"
 MEMORY_DIR="${MEMORY_DIR:-/opt/openclaw-memory}"
 SERVICE_NAME="${SERVICE_NAME:-codex-telegram-gateway.service}"
+SUPERVISOR_SERVICE_NAME="${SUPERVISOR_SERVICE_NAME:-codex-telegram-task-supervisor.service}"
 
 failures=0
 
@@ -26,11 +27,14 @@ check "python compile gateway" python3 -m py_compile \
   "${APP_DIR}/gateway.py" \
   "${APP_DIR}/task_store.py" \
   "${APP_DIR}/task_worker.py" \
+  "${APP_DIR}/task_supervisor.py" \
   "${APP_DIR}/telegram_sender.py" \
   "${APP_DIR}/memory_adapter.py" \
   "${APP_DIR}/facts_store.py"
 check "systemd unit enabled" systemctl is-enabled "${SERVICE_NAME}"
 check "systemd unit active" systemctl is-active "${SERVICE_NAME}"
+check "supervisor unit enabled" systemctl is-enabled "${SUPERVISOR_SERVICE_NAME}"
+check "supervisor unit active" systemctl is-active "${SUPERVISOR_SERVICE_NAME}"
 check "systemd-run available" systemd-run --wait --collect --unit openclaw-smoke-true /bin/true
 check "codex cli exists" command -v codex
 check "memory env exists" test -f "${MEMORY_DIR}/config/memory.env"

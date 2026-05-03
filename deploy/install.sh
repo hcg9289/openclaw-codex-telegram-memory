@@ -5,6 +5,7 @@ APP_DIR="${APP_DIR:-/opt/codex-telegram-gateway}"
 MEMORY_DIR="${MEMORY_DIR:-/opt/openclaw-memory}"
 STATE_DIR="${STATE_DIR:-/var/lib/codex-telegram-gateway}"
 SERVICE_NAME="${SERVICE_NAME:-codex-telegram-gateway.service}"
+SUPERVISOR_SERVICE_NAME="${SUPERVISOR_SERVICE_NAME:-codex-telegram-task-supervisor.service}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WITH_MEMORY=0
 START_GATEWAY=1
@@ -79,8 +80,10 @@ copy_memory() {
 
 install_service() {
   install -m 0644 "${REPO_DIR}/deploy/systemd/${SERVICE_NAME}" "/etc/systemd/system/${SERVICE_NAME}"
+  install -m 0644 "${REPO_DIR}/deploy/systemd/${SUPERVISOR_SERVICE_NAME}" "/etc/systemd/system/${SUPERVISOR_SERVICE_NAME}"
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}"
+  systemctl enable "${SUPERVISOR_SERVICE_NAME}"
 }
 
 create_state_dirs() {
@@ -119,7 +122,9 @@ main() {
 
   if [[ "${START_GATEWAY}" -eq 1 && env_ready ]]; then
     systemctl restart "${SERVICE_NAME}"
+    systemctl restart "${SUPERVISOR_SERVICE_NAME}"
     systemctl --no-pager --full status "${SERVICE_NAME}" || true
+    systemctl --no-pager --full status "${SUPERVISOR_SERVICE_NAME}" || true
   else
     echo "Gateway was installed but not started because ${APP_DIR}/.env is not ready or --no-start was used."
   fi
