@@ -81,6 +81,14 @@ When Codex starts any long-running background process, it must write:
 
 The watch file can include `pid_file`, `progress_file`, `heartbeat_file`, `log_file`, `stderr_file`, `final_report`, `resume_command`, and `stale_after_seconds`.
 
+Long-running tasks should also declare `resource_key`, `resource_dir`, and `lock_mode=exclusive`. The supervisor records resource ownership under:
+
+```text
+/var/lib/codex-telegram-gateway/resource_locks/<resource_key>.json
+```
+
+Supervisor recovery tasks write their internal work to the parent task's `supervisor_thread.jsonl` instead of polluting the main `recent_messages.jsonl`.
+
 ## Runtime Layout
 
 ```text
@@ -100,6 +108,7 @@ The watch file can include `pid_file`, `progress_file`, `heartbeat_file`, `log_f
   memory/
   tasks/
   jobs/
+  resource_locks/
 
 /etc/systemd/system/codex-telegram-gateway.service
 /etc/systemd/system/codex-telegram-task-supervisor.service
