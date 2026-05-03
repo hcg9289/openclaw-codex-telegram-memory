@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,8 @@ import memory_adapter
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/codex-telegram-gateway"))
 TASKS_DIR = STATE_DIR / "tasks"
-ACTIVE_STATUSES = {"queued", "starting", "running", "watching", "needs_attention", "finalizing"}
+RESOURCE_LOCKS_DIR = STATE_DIR / "resource_locks"
+ACTIVE_STATUSES = {"queued", "starting", "running", "watching", "needs_attention", "finalizing", "blocked_by_resource"}
 FINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 OBSERVE_WORDS = [
     "剛才",
@@ -106,6 +108,7 @@ def create_task(user_text, chat_id, user_id):
     write_json(root / "task.json", task)
     write_json(root / "status.json", task)
     append_event(task_id, "created", {"title": task["title"], "is_observation": task["is_observation"]})
+    append_thread_message(task_id, "thread.jsonl", "user", user_text, {"source": "task_create"})
     return task
 
 
@@ -131,6 +134,19 @@ def append_event(task_id, event_type, payload=None):
         "payload": payload or {},
     }
     path = task_dir(task_id) / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def append_thread_message(task_id, filename, role, text, metadata=None):
+    item = {
+        "ts": utc_now(),
+        "role": role,
+        "text": memory_adapter.redact_secrets(str(text or "")),
+        "metadata": metadata or {},
+    }
+    path = task_dir(task_id) / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -162,12 +178,108 @@ def read_events_tail(task_id, limit=20):
     return memory_adapter.redact_secrets("\n".join(lines))
 
 
+def read_jsonl_tail(task_id, filename, limit=20):
+    path = task_dir(task_id) / filename
+    if not path.exists():
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    return memory_adapter.redact_secrets("\n".join(lines))
+
+
 def read_task_json(task_id, filename, default=None):
     return read_json(task_dir(task_id) / filename, default=default)
 
 
 def write_task_json(task_id, filename, data):
     write_json(task_dir(task_id) / filename, data)
+
+
+def _path_token(value):
+    if not value:
+        return ""
+    return str(value).strip()
+
+
+def derive_resource_key(watch):
+    if not isinstance(watch, dict):
+        return ""
+    explicit = str(watch.get("resource_key") or "").strip()
+    if explicit:
+        return explicit
+    for key in ("resource_dir", "final_report", "final_report_path", "report_path", "progress_file", "pid_file"):
+        value = _path_token(watch.get(key))
+        if value:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            return f"path.{digest}"
+    return ""
+
+
+def resource_lock_path(resource_key):
+    return RESOURCE_LOCKS_DIR / (safe_name(resource_key).replace(".", "_") + ".json")
+
+
+def read_resource_lock(resource_key):
+    if not resource_key:
+        return None
+    return read_json(resource_lock_path(resource_key), default=None)
+
+
+def write_resource_lock(resource_key, lock):
+    write_json(resource_lock_path(resource_key), lock)
+
+
+def active_owner(lock):
+    owner = get_task(lock.get("owner_task_id")) if isinstance(lock, dict) else None
+    return owner if owner and owner.get("status") in ACTIVE_STATUSES else None
+
+
+def acquire_resource_lock(task, watch):
+    resource_key = derive_resource_key(watch)
+    if not resource_key:
+        return True, None, None
+    RESOURCE_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    task_id = task.get("task_id")
+    existing = read_resource_lock(resource_key)
+    if existing and existing.get("status") == "locked" and existing.get("owner_task_id") != task_id:
+        owner = active_owner(existing)
+        if owner:
+            return False, existing, owner
+        existing["status"] = "released"
+        existing["released_at"] = utc_now()
+        existing["release_reason"] = "owner_not_active"
+        write_resource_lock(resource_key, existing)
+    lock = {
+        "resource_key": resource_key,
+        "owner_task_id": task_id,
+        "owner_title": task.get("title"),
+        "resource_dir": watch.get("resource_dir"),
+        "lock_mode": watch.get("lock_mode") or "exclusive",
+        "status": "locked",
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "expires_after_seconds": int(watch.get("expires_after_seconds") or 21600),
+        "watch_file": str(task_dir(task_id) / "watch.json"),
+        "lock_file": str(resource_lock_path(resource_key)),
+    }
+    write_resource_lock(resource_key, lock)
+    return True, lock, None
+
+
+def release_resource_locks_for_task(task_id, reason="task_final"):
+    if not RESOURCE_LOCKS_DIR.exists():
+        return []
+    released = []
+    for path in RESOURCE_LOCKS_DIR.glob("*.json"):
+        lock = read_json(path, default=None)
+        if not lock or lock.get("owner_task_id") != task_id or lock.get("status") != "locked":
+            continue
+        lock["status"] = "released"
+        lock["released_at"] = utc_now()
+        lock["updated_at"] = utc_now()
+        lock["release_reason"] = reason
+        write_json(path, lock)
+        released.append(lock.get("resource_key"))
+    return released
 
 
 def list_tasks(limit=10, include_system=True):
@@ -236,6 +348,14 @@ def task_context(task_id, limit_chars=12000):
         f"updated_at={task.get('updated_at')}",
         f"error={task.get('error')}",
         f"user_text={task.get('user_text')}",
+        "",
+        "[task_thread_tail]",
+        read_jsonl_tail(task_id, "thread.jsonl", limit=20) or "(empty)",
+        "[/task_thread_tail]",
+        "",
+        "[supervisor_thread_tail]",
+        read_jsonl_tail(task_id, "supervisor_thread.jsonl", limit=30) or "(empty)",
+        "[/supervisor_thread_tail]",
         "",
         "[watch_json]",
         json.dumps(read_task_json(task_id, "watch.json", default={}) or {}, ensure_ascii=False, indent=2),

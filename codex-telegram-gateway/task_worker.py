@@ -44,6 +44,7 @@ def main():
     chat_id = task.get("chat_id")
     user_id = task.get("user_id")
     user_text = task.get("user_text") or ""
+    parent_task_id = task.get("supervisor_for")
 
     task_store.update_task(task_id, status="running", started_at=task_store.utc_now(), error=None)
     task_store.append_event(task_id, "started", {})
@@ -56,7 +57,7 @@ def main():
     try:
         recent_context = gateway.format_recent_context()
         recall_query = gateway.build_recall_query(user_text)
-        referenced = task_store.resolve_referenced_task(user_text, exclude_task_id=task_id)
+        referenced = task_store.get_task(parent_task_id) if parent_task_id else task_store.resolve_referenced_task(user_text, exclude_task_id=task_id)
         if referenced:
             recall_query += "\n\nReferenced task context:\n" + task_store.task_context(referenced["task_id"], limit_chars=8000)
         recall_result = memory_adapter.recall_memory(recall_query, session_id=str(chat_id), top_k=5, timeout=45)
@@ -109,6 +110,9 @@ Schema:
   "enabled": true,
   "kind": "external_process",
   "summary": "short human-readable description",
+  "resource_key": "stable.unique.resource.name",
+  "resource_dir": "/absolute/path/to/external/work/dir",
+  "lock_mode": "exclusive",
   "pid": 12345,
   "pid_file": "/absolute/path/to/runner.pid",
   "progress_file": "/absolute/path/to/progress.json",
@@ -121,8 +125,14 @@ Schema:
 }}
 
 Only include paths that truly exist or will be created by the runner. Do not include secrets.
+Before starting a second runner against the same resource_dir/final_report/progress_file, inspect existing task folders and resource_locks. If the resource is locked, continue/inspect the existing task instead of launching a duplicate runner.
 If no long-running/background work is started, do not create watch.json.
 [/TASK_WATCH_CONTRACT]
+
+[THREAD_MEMORY_RULE]
+Normal tasks may write concise conclusions into main recent memory.
+Supervisor child tasks with supervisor_for=<parent_task_id> must not pollute main recent memory. They must write root cause, recovery actions, and final status into the parent task supervisor_thread.jsonl through the gateway runtime.
+[/THREAD_MEMORY_RULE]
 
 [REFERENCED_TASK_CONTEXT]
 {task_context}
@@ -185,30 +195,61 @@ Write your final Telegram answer as the final response. Do not claim work is com
     safe_result = memory_adapter.redact_secrets(result)
     watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
     if status == "succeeded" and isinstance(watch, dict) and watch.get("enabled", False):
-        status = "watching"
-        safe_result = (
-            safe_result.rstrip()
-            + "\n\n[supervisor]\n"
-            + "此 task 已登記 watch.json，將由 codex-telegram-task-supervisor.service 持續監護，直到完成或明確失敗。\n"
-            + "[/supervisor]"
-        )
-        task_store.append_event(task_id, "watch_registered", {"watch": watch})
+        ok, lock, owner = task_store.acquire_resource_lock(task_store.get_task(task_id) or task, watch)
+        if ok:
+            if lock:
+                watch["resource_key"] = lock.get("resource_key")
+                watch["lock_file"] = lock.get("lock_file")
+                watch.setdefault("lock_mode", lock.get("lock_mode") or "exclusive")
+                task_store.write_task_json(task_id, "watch.json", watch)
+            status = "watching"
+            safe_result = (
+                safe_result.rstrip()
+                + "\n\n[supervisor]\n"
+                + "此 task 已登記 watch.json，將由 codex-telegram-task-supervisor.service 持續監護，直到完成或明確失敗。\n"
+                + (f"resource_key={lock.get('resource_key')}\n" if lock else "")
+                + "[/supervisor]"
+            )
+            task_store.append_event(task_id, "watch_registered", {"watch": watch, "lock": lock})
+        else:
+            status = "blocked_by_resource"
+            safe_result = (
+                safe_result.rstrip()
+                + "\n\n[resource_lock]\n"
+                + "此 task 嘗試登記的外部資源已被另一個 active/watching task 持有，因此已阻止重複 runner。\n"
+                + f"owner_task_id={owner.get('task_id') if owner else None}\n"
+                + f"owner_title={owner.get('title') if owner else None}\n"
+                + f"resource_key={(lock or {}).get('resource_key')}\n"
+                + "請改為接續/查詢既有 task，或等待 lock 釋放。\n"
+                + "[/resource_lock]"
+            )
+            task_store.append_event(task_id, "resource_lock_blocked", {"lock": lock, "owner": owner})
     task_store.write_task_text(task_id, "stderr.log", "")
     task_store.write_task_text(task_id, "result.md", safe_result)
     task_store.update_task(
         task_id,
         status=status,
-        error=None if status == "succeeded" else safe_result[:1000],
+        error=None if status in {"succeeded", "watching"} else safe_result[:1000],
         returncode=returncode,
         duration_seconds=round(time.time() - started, 2),
     )
     task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
 
     if chat_id:
-        heading = "任務已進入監護" if status == "watching" else "任務完成"
+        heading = "任務已進入監護" if status == "watching" else ("任務被資源鎖阻止" if status == "blocked_by_resource" else "任務完成")
         telegram_sender.send_message(chat_id, f"{heading}：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}")
-    gateway.append_recent("assistant", safe_result, chat_id, user_id)
-    if gateway.should_auto_remember(user_text, safe_result):
+    task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe_result, {"status": status})
+    if parent_task_id:
+        task_store.append_thread_message(
+            parent_task_id,
+            "supervisor_thread.jsonl",
+            "assistant",
+            safe_result,
+            {"child_task_id": task_id, "reason": task.get("supervisor_reason"), "status": status},
+        )
+    else:
+        gateway.append_recent("assistant", safe_result, chat_id, user_id)
+    if not parent_task_id and gateway.should_auto_remember(user_text, safe_result):
         gateway.remember_async(
             f"Telegram background task:\nUser: {user_text}\nAssistant: {safe_result}",
             {"source": "telegram_task", "chat_id": chat_id, "user_id": user_id, "task_id": task_id},

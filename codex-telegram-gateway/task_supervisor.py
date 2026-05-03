@@ -220,9 +220,27 @@ reason={reason}
     )
     task_store.update_task(parent_id, status="needs_attention", supervisor_child_task_id=child_id)
     task_store.append_event(parent_id, "supervision_task_created", {"child_task_id": child_id, "reason": reason})
+    task_store.append_thread_message(
+        parent_id,
+        "supervisor_thread.jsonl",
+        "supervisor",
+        f"Created supervision task {child_id} for reason={reason}.\n\nEvidence:\n{evidence}",
+        {"child_task_id": child_id, "reason": reason},
+    )
     write_supervision_state(parent_id, state)
     start_task(task_store.get_task(child_id))
     return child_id
+
+
+def append_main_recent(task, text):
+    if not task.get("chat_id"):
+        return
+    try:
+        import gateway
+
+        gateway.append_recent("assistant", text, task.get("chat_id"), task.get("user_id"))
+    except Exception as exc:
+        task_store.append_event(task.get("task_id"), "main_recent_append_failed", {"error": f"{type(exc).__name__}: {exc}"})
 
 
 def finalize_watched_task(task, watch):
@@ -239,7 +257,12 @@ def finalize_watched_task(task, watch):
     safe = memory_adapter.redact_secrets(text)
     task_store.write_task_text(task_id, "result.md", safe)
     task_store.update_task(task_id, status="succeeded", error=None, supervisor_completed_at=task_store.utc_now())
+    task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe, {"source": "supervisor_finalized"})
     task_store.append_event(task_id, "supervisor_finalized", {"final_report": report_path})
+    released = task_store.release_resource_locks_for_task(task_id, reason="supervisor_finalized")
+    if released:
+        task_store.append_event(task_id, "resource_locks_released", {"resource_keys": released})
+    append_main_recent(task, f"任務已完成：{task.get('title')}\ntask_id：{task_id}\nfinal_report：{report_path}")
     if task.get("chat_id"):
         telegram_sender.send_message(task.get("chat_id"), safe)
 
@@ -249,6 +272,30 @@ def inspect_watch(task):
     watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
     if not isinstance(watch, dict) or not watch.get("enabled", False):
         return
+
+    lock_ok, lock, owner = task_store.acquire_resource_lock(task, watch)
+    if not lock_ok:
+        evidence = json.dumps(
+            {
+                "blocked_task_id": task_id,
+                "blocked_title": task.get("title"),
+                "resource_key": (lock or {}).get("resource_key"),
+                "owner_task_id": owner.get("task_id") if owner else None,
+                "owner_title": owner.get("title") if owner else None,
+                "owner_status": owner.get("status") if owner else None,
+                "lock": lock,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        task_store.update_task(task_id, status="blocked_by_resource", error="resource is locked by another active task")
+        task_store.append_event(task_id, "resource_lock_blocked", {"lock": lock, "owner_task_id": owner.get("task_id") if owner else None})
+        spawn_supervision_task(task, "resource_conflict", evidence)
+        return
+    if lock:
+        watch["resource_key"] = lock.get("resource_key")
+        watch["lock_file"] = lock.get("lock_file")
+        task_store.write_task_json(task_id, "watch.json", watch)
 
     final_report = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
     if file_nonempty(final_report):
@@ -315,6 +362,9 @@ def inspect_active_task(task):
     if status == "needs_attention":
         return
 
+    if status == "blocked_by_resource":
+        return
+
     if status in {"starting", "running", "finalizing"}:
         active = unit_active(task.get("unit_name"))
         if active is True:
@@ -347,6 +397,8 @@ def supervisor_pass():
         check=False,
     )
     for task in task_store.list_tasks(limit=1000):
+        if task.get("status") in task_store.FINAL_STATUSES:
+            task_store.release_resource_locks_for_task(task.get("task_id"), reason=f"task_{task.get('status')}")
         if task.get("status") in task_store.ACTIVE_STATUSES:
             try:
                 inspect_active_task(task)
