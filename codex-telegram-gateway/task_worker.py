@@ -82,6 +82,15 @@ If the user asks for result, only read and summarize existing result.
 If evidence is insufficient, say so instead of doing extra work.
 [/STRICT_SCOPE_RULE]
 
+[TELEGRAM_REPLY_STYLE]
+用繁體中文自然回覆，像工程拍檔向手機上的人報告，不要像制式報告。
+- 第一句先講人話結論，不要以「最終目標：」開頭。
+- 除非使用者要求，不要輸出「使用 Skill：」「證據：」這類固定欄位。
+- 如需證據，最多列 3 個短項目；避免大段 code block 或 JSON。
+- 對進度/巡檢回覆，必須包含目前進度、完成百分比；資料足夠時估 ETA，資料不足時明講不能估。
+- task_id 由 gateway 放在訊息最後，你的正文不用重複 task_id。
+[/TELEGRAM_REPLY_STYLE]
+
 [ENGINEERING_OWNER_PROTOCOL]
 你是會持續接管結果的工程負責人，不是只回答問題的 worker。
 
@@ -240,8 +249,17 @@ Write your final Telegram answer as the final response. Do not claim work is com
     task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
 
     if chat_id:
-        heading = "任務已進入監護" if status == "watching" else ("任務被資源鎖阻止" if status == "blocked_by_resource" else "任務完成")
-        telegram_sender.send_message(chat_id, f"{heading}：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}")
+        if parent_task_id:
+            telegram_text = f"{safe_result}\n\n巡檢 task_id：{task_id}\n狀態：{status}"
+        elif status == "watching":
+            telegram_text = f"{safe_result}\n\n已登記監護 task_id：{task_id}"
+        elif status == "blocked_by_resource":
+            telegram_text = f"{safe_result}\n\n被資源鎖阻止 task_id：{task_id}"
+        elif status == "failed":
+            telegram_text = f"{safe_result}\n\n失敗 task_id：{task_id}"
+        else:
+            telegram_text = f"{safe_result}\n\ntask_id：{task_id}"
+        telegram_sender.send_message(chat_id, telegram_text)
     task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe_result, {"status": status})
     if parent_task_id:
         task_store.append_thread_message(

@@ -96,6 +96,104 @@ def read_text_tail(path, limit=3000):
         return ""
 
 
+def read_json_file(path):
+    if not path:
+        return None
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def number_from(data, *keys):
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return None
+
+
+def format_duration(seconds):
+    if seconds is None:
+        return None
+    try:
+        seconds = max(0, int(float(seconds)))
+    except Exception:
+        return None
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def progress_metrics(watch, state):
+    path = watch.get("progress_file") if isinstance(watch, dict) else None
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return {"available": False, "path": path}
+
+    completed = number_from(data, "completed", "done", "processed", "current", "finished")
+    total = number_from(data, "total", "total_items", "total_tasks", "target")
+    elapsed = number_from(data, "elapsed_sec", "elapsed_seconds", "runtime_seconds")
+    now = time.time()
+    percent = None
+    eta_seconds = None
+    eta_source = None
+    if completed is not None and total and total > 0:
+        percent = min(100.0, max(0.0, completed / total * 100.0))
+        remaining = max(0.0, total - completed)
+        previous = state.get("progress_snapshot") if isinstance(state, dict) else None
+        if isinstance(previous, dict):
+            prev_completed = number_from(previous, "completed")
+            prev_ts = number_from(previous, "ts")
+            if prev_completed is not None and prev_ts is not None:
+                delta_completed = completed - prev_completed
+                delta_seconds = now - prev_ts
+                if delta_completed > 0 and delta_seconds > 0:
+                    eta_seconds = remaining / (delta_completed / delta_seconds)
+                    eta_source = "recent_rate"
+        if eta_seconds is None and elapsed and elapsed > 0 and completed > 0:
+            eta_seconds = remaining / (completed / elapsed)
+            eta_source = "average_rate"
+
+    summary = None
+    if completed is not None and total:
+        summary = f"{int(completed)}/{int(total)}"
+        if percent is not None:
+            summary += f" ({percent:.1f}%)"
+        if eta_seconds is not None:
+            summary += f", ETA about {format_duration(eta_seconds)}"
+
+    metrics = {
+        "available": True,
+        "path": path,
+        "stage": data.get("stage"),
+        "status": data.get("status"),
+        "updated_at": data.get("updated_at"),
+        "completed": int(completed) if completed is not None else None,
+        "total": int(total) if total is not None else None,
+        "percent": round(percent, 2) if percent is not None else None,
+        "elapsed_sec": round(elapsed, 2) if elapsed is not None else None,
+        "eta_seconds": round(eta_seconds, 2) if eta_seconds is not None else None,
+        "eta_human": format_duration(eta_seconds) if eta_seconds is not None else None,
+        "eta_source": eta_source,
+        "summary": summary,
+    }
+    if completed is not None:
+        state["progress_snapshot"] = {"completed": completed, "total": total, "ts": now}
+    return metrics
+
+
 def pid_alive(pid):
     try:
         pid = int(str(pid).strip())
@@ -294,10 +392,16 @@ reason={reason}
 你必須：
 1. 讀取父 task folder、watch.json、progress file、heartbeat、runner log、stderr/stdout、final report path。
 2. 判斷現在是正常推進、假 running、stale、已完成、還是明確失敗。
-3. 若仍正常推進，只用簡短繁體中文回報「目前進度 + 證據 + 下次應檢查什麼」。
+3. 若仍正常推進，必須用 progress 估算完成百分比；若有足夠資料，給 ETA；若不足，直接說無法估 ETA。
 4. 若 final report 已存在，讀取並總結結果；不要只說檔案存在。
 5. 若卡住或失敗，說清楚 root cause 證據與下一步；只有在 resource lock 不衝突且 resume_command 明確安全時才可補救。
 6. 不要啟動第二個相同 runner；先查 resource lock 和既有 PID。
+
+回覆格式必須適合手機閱讀：
+- 第一句就是人話結論，不要以「最終目標：」開頭。
+- 第一段必須包含：目前是否正常、完成百分比、ETA 或「暫時不能估算」。
+- 後面最多 3 個短項目：進度、證據、下一次要看什麼。
+- 不要貼大段 JSON、不要長 code block、不要像審計報告。
 
 這是 watcher，不是新任務；不要擴大範圍。
 """
@@ -412,6 +516,8 @@ def inspect_watch(task):
     state["pid"] = pid
     state["pid_alive"] = alive
     state["freshest_file_age_seconds"] = round(freshest_age, 2) if freshest_age is not None else None
+    progress = progress_metrics(watch, state)
+    state["progress"] = progress
     write_supervision_state(task_id, state)
 
     if alive and fresh:
@@ -424,6 +530,7 @@ def inspect_watch(task):
                 "freshest_file_age_seconds": round(freshest_age, 2) if freshest_age is not None else None,
                 "stale_after_seconds": stale_after,
                 "final_report_exists": file_nonempty(final_report),
+                "progress": progress,
                 "watch": watch,
             },
             ensure_ascii=False,
@@ -439,6 +546,7 @@ def inspect_watch(task):
             "freshest_file_age_seconds": round(freshest_age, 2) if freshest_age is not None else None,
             "stale_after_seconds": stale_after,
             "final_report_exists": file_nonempty(final_report),
+            "progress": progress,
             "watch": watch,
         },
         ensure_ascii=False,
