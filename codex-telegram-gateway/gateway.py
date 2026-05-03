@@ -159,7 +159,7 @@ def read_agents_excerpt():
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     selected = []
     for line in lines:
-        if any(keyword in line for keyword in ["本機", "Must", "禁止", "secrets", "Skills", "指令", "驗證", "目標系統"]):
+        if any(keyword in line for keyword in ["本機", "Must", "禁止", "secrets", "Skills", "指令", "驗證", "目標系統", "工程負責人", "長任務", "證據", "接管", "補救", "人話", "heartbeat", "checkpoint"]):
             selected.append(line)
         if len(selected) >= 35:
             break

@@ -42,6 +42,7 @@ For memory Docker Compose, the installer links `/opt/openclaw-memory/.env` to `/
 - New VPS installer
 - systemd unit
 - smoke check script
+- Engineering owner prompt protocol for long task stewardship
 
 ## Excluded
 
@@ -58,6 +59,16 @@ Copy example env files before use and fill secrets only on the target VPS.
 Never commit real env files or Codex auth directories.
 
 The Telegram task worker runs Codex with `--dangerously-bypass-approvals-and-sandbox` because this VPS is intentionally operated as a trusted automation host. Do not use this mode on an untrusted machine or with untrusted Telegram users.
+
+## Engineering Owner Behavior
+
+Telegram background tasks are prompted to behave like an engineering owner, not only an answer worker:
+
+- A started process is not treated as an owned workflow.
+- Long tasks require heartbeat/progress, checkpoint/resume, failure evidence, and final-report detection.
+- Progress/result questions must inspect task folders, progress files, runner logs, or final reports.
+- If a task is stale or interrupted, Codex must inspect root cause before restarting.
+- Replies should keep useful structure, then give a natural Traditional Chinese conclusion for phone use.
 
 ## Runtime Layout
 
