@@ -39,6 +39,7 @@ POLL_SECONDS = int(os.environ.get("TASK_SUPERVISOR_INTERVAL_SECONDS", "60"))
 TASK_STALE_SECONDS = int(os.environ.get("TASK_STALE_SECONDS", "900"))
 WATCH_STALE_SECONDS = int(os.environ.get("WATCH_STALE_SECONDS", "900"))
 SUPERVISION_COOLDOWN_SECONDS = int(os.environ.get("SUPERVISION_COOLDOWN_SECONDS", "900"))
+CODEX_WATCHER_INTERVAL_SECONDS = int(os.environ.get("CODEX_WATCHER_INTERVAL_SECONDS", "300"))
 MAX_SUPERVISION_TASKS_PER_PARENT = int(os.environ.get("MAX_SUPERVISION_TASKS_PER_PARENT", "3"))
 MAX_ACTIVE_WORK_TASKS = int(os.environ.get("MAX_ACTIVE_WORK_TASKS", "2"))
 
@@ -151,6 +152,18 @@ def write_supervision_state(task_id, state):
     task_store.write_task_json(task_id, "supervisor_state.json", state)
 
 
+def active_child_task(parent_id, reasons=None):
+    reasons = set(reasons or [])
+    for task in task_store.list_tasks(limit=1000):
+        if task.get("supervisor_for") != parent_id:
+            continue
+        if reasons and task.get("supervisor_reason") not in reasons:
+            continue
+        if task.get("status") in task_store.ACTIVE_STATUSES:
+            return task
+    return None
+
+
 def can_spawn_supervision(task_id, reason):
     state = supervision_state(task_id)
     incidents = state.setdefault("incidents", {})
@@ -162,6 +175,17 @@ def can_spawn_supervision(task_id, reason):
         return False, state
     item["count"] += 1
     item["last_ts"] = now
+    return True, state
+
+
+def can_spawn_periodic_watch(task_id):
+    state = supervision_state(task_id)
+    now = time.time()
+    last_ts = float(state.get("last_codex_watch_spawn_ts") or 0)
+    if now - last_ts < CODEX_WATCHER_INTERVAL_SECONDS:
+        return False, state
+    state["last_codex_watch_spawn_ts"] = now
+    state["codex_watch_count"] = int(state.get("codex_watch_count") or 0) + 1
     return True, state
 
 
@@ -181,6 +205,14 @@ def start_task(task):
 
 def spawn_supervision_task(parent, reason, evidence):
     parent_id = parent.get("task_id")
+    existing = active_child_task(parent_id, reasons={reason})
+    if existing:
+        task_store.append_event(
+            parent_id,
+            "supervision_existing_active",
+            {"child_task_id": existing.get("task_id"), "reason": reason},
+        )
+        return existing.get("task_id")
     allowed, state = can_spawn_supervision(parent_id, reason)
     if not allowed:
         task_store.append_event(parent_id, "supervision_suppressed", {"reason": reason})
@@ -225,6 +257,65 @@ reason={reason}
         "supervisor_thread.jsonl",
         "supervisor",
         f"Created supervision task {child_id} for reason={reason}.\n\nEvidence:\n{evidence}",
+        {"child_task_id": child_id, "reason": reason},
+    )
+    write_supervision_state(parent_id, state)
+    start_task(task_store.get_task(child_id))
+    return child_id
+
+
+def spawn_periodic_watch_task(parent, reason, evidence):
+    parent_id = parent.get("task_id")
+    existing = active_child_task(parent_id, reasons={"periodic_codex_watch", "final_report_detected"})
+    if existing:
+        task_store.append_event(
+            parent_id,
+            "codex_watch_existing_active",
+            {"child_task_id": existing.get("task_id"), "reason": existing.get("supervisor_reason")},
+        )
+        return existing.get("task_id")
+    allowed, state = can_spawn_periodic_watch(parent_id)
+    if not allowed:
+        return None
+
+    user_text = f"""你是 Codex Telegram Gateway 的定期 watcher。Python supervisor 只負責每 5 分鐘喚醒你；真正的工程判斷由你做。
+
+父 task 未完成，需要你巡檢：
+task_id={parent_id}
+title={parent.get('title')}
+status={parent.get('status')}
+reason={reason}
+
+機械證據：
+{evidence}
+
+請只巡檢這個父 task，不要做無關工作。
+
+你必須：
+1. 讀取父 task folder、watch.json、progress file、heartbeat、runner log、stderr/stdout、final report path。
+2. 判斷現在是正常推進、假 running、stale、已完成、還是明確失敗。
+3. 若仍正常推進，只用簡短繁體中文回報「目前進度 + 證據 + 下次應檢查什麼」。
+4. 若 final report 已存在，讀取並總結結果；不要只說檔案存在。
+5. 若卡住或失敗，說清楚 root cause 證據與下一步；只有在 resource lock 不衝突且 resume_command 明確安全時才可補救。
+6. 不要啟動第二個相同 runner；先查 resource lock 和既有 PID。
+
+這是 watcher，不是新任務；不要擴大範圍。
+"""
+    child = task_store.create_task(user_text, parent.get("chat_id"), parent.get("user_id"))
+    child_id = child["task_id"]
+    task_store.update_task(
+        child_id,
+        is_observation=True,
+        title=f"監護巡檢：{parent.get('title')}",
+        supervisor_for=parent_id,
+        supervisor_reason=reason,
+    )
+    task_store.append_event(parent_id, "codex_watch_task_created", {"child_task_id": child_id, "reason": reason})
+    task_store.append_thread_message(
+        parent_id,
+        "supervisor_thread.jsonl",
+        "supervisor",
+        f"Created periodic Codex watcher task {child_id} for reason={reason}.\n\nEvidence:\n{evidence}",
         {"child_task_id": child_id, "reason": reason},
     )
     write_supervision_state(parent_id, state)
@@ -326,6 +417,19 @@ def inspect_watch(task):
     if alive and fresh:
         if age_seconds(task.get("updated_at")) > min(stale_after, 300):
             task_store.update_task(task_id, status="watching", error=None)
+        evidence = json.dumps(
+            {
+                "pid": pid,
+                "pid_alive": alive,
+                "freshest_file_age_seconds": round(freshest_age, 2) if freshest_age is not None else None,
+                "stale_after_seconds": stale_after,
+                "final_report_exists": file_nonempty(final_report),
+                "watch": watch,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        spawn_periodic_watch_task(task_store.get_task(task_id) or task, "periodic_codex_watch", evidence)
         return
 
     evidence = json.dumps(
@@ -360,6 +464,9 @@ def inspect_active_task(task):
         return
 
     if status == "needs_attention":
+        watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
+        if isinstance(watch, dict) and watch.get("enabled", False):
+            inspect_watch(task)
         return
 
     if status == "blocked_by_resource":
