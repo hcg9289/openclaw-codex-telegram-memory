@@ -36,6 +36,7 @@ For memory Docker Compose, the installer links `/opt/openclaw-memory/.env` to `/
 
 - Codex Telegram Gateway Python source
 - Background task worker/store/starter
+- Universal task supervisor
 - Current facts and cognee memory adapters
 - OpenClaw memory helper scripts
 - Example environment files
@@ -70,12 +71,23 @@ Telegram background tasks are prompted to behave like an engineering owner, not 
 - If a task is stale or interrupted, Codex must inspect root cause before restarting.
 - Replies should keep useful structure, then give a natural Traditional Chinese conclusion for phone use.
 
+`codex-telegram-task-supervisor.service` continuously scans task folders. It starts queued tasks, monitors active Codex tasks, watches registered background runners via `watch.json`, and creates Codex supervision tasks when work becomes stale, loses its PID, or lacks a final report.
+
+When Codex starts any long-running background process, it must write:
+
+```text
+/var/lib/codex-telegram-gateway/tasks/<task_id>/watch.json
+```
+
+The watch file can include `pid_file`, `progress_file`, `heartbeat_file`, `log_file`, `stderr_file`, `final_report`, `resume_command`, and `stale_after_seconds`.
+
 ## Runtime Layout
 
 ```text
 /opt/codex-telegram-gateway/
   gateway.py
   task_worker.py
+  task_supervisor.py
   .env
 
 /opt/openclaw-memory/
@@ -90,6 +102,7 @@ Telegram background tasks are prompted to behave like an engineering owner, not 
   jobs/
 
 /etc/systemd/system/codex-telegram-gateway.service
+/etc/systemd/system/codex-telegram-task-supervisor.service
 ```
 
 ## What Cannot Be Restored Automatically
