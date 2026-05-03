@@ -88,7 +88,7 @@ install_service() {
 
 create_state_dirs() {
   install -d -m 0700 "${STATE_DIR}"
-  install -d -m 0700 "${STATE_DIR}/memory" "${STATE_DIR}/tasks" "${STATE_DIR}/jobs"
+  install -d -m 0700 "${STATE_DIR}/memory" "${STATE_DIR}/tasks" "${STATE_DIR}/jobs" "${STATE_DIR}/resource_locks"
 }
 
 env_ready() {
