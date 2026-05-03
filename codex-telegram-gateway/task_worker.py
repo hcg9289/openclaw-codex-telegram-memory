@@ -249,16 +249,15 @@ Write your final Telegram answer as the final response. Do not claim work is com
     task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
 
     if chat_id:
-        if parent_task_id:
-            telegram_text = f"{safe_result}\n\n巡檢 task_id：{task_id}\n狀態：{status}"
-        elif status == "watching":
-            telegram_text = f"{safe_result}\n\n已登記監護 task_id：{task_id}"
+        if status == "watching":
+            heading = "任務已進入監護"
         elif status == "blocked_by_resource":
-            telegram_text = f"{safe_result}\n\n被資源鎖阻止 task_id：{task_id}"
+            heading = "任務被資源鎖阻止"
         elif status == "failed":
-            telegram_text = f"{safe_result}\n\n失敗 task_id：{task_id}"
+            heading = "任務失敗"
         else:
-            telegram_text = f"{safe_result}\n\ntask_id：{task_id}"
+            heading = "任務完成"
+        telegram_text = f"{heading}：{task.get('title')}\ntask_id：{task_id}\n狀態：{status}\n\n{safe_result}"
         telegram_sender.send_message(chat_id, telegram_text)
     task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe_result, {"status": status})
     if parent_task_id:
