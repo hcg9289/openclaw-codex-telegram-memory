@@ -73,6 +73,8 @@ Telegram background tasks are prompted to behave like an engineering owner, not 
 
 `codex-telegram-task-supervisor.service` continuously scans task folders. It starts queued tasks, monitors active Codex tasks, watches registered background runners via `watch.json`, and creates Codex supervision tasks when work becomes stale, loses its PID, or lacks a final report.
 
+The gateway also batches rapid Telegram messages for a short window (`MESSAGE_BATCH_DELAY_SECONDS`, default `8`) before creating a task. This keeps multi-part phone messages and long instructions in one coherent Codex task instead of splitting them into several unrelated tasks.
+
 When Codex starts any long-running background process, it must write:
 
 ```text
@@ -88,6 +90,10 @@ Long-running tasks should also declare `resource_key`, `resource_dir`, and `lock
 ```
 
 Supervisor recovery tasks write their internal work to the parent task's `supervisor_thread.jsonl` instead of polluting the main `recent_messages.jsonl`.
+
+Fresh watched runners do not trigger repeated Codex calls on every supervisor pass. The supervisor records fresh progress/heartbeat events mechanically. It only opens Codex supervision when a task loses its Codex process without `watch.json`, becomes stale, loses its PID, or otherwise needs root-cause judgment. The Codex watcher interval is controlled by `CODEX_WATCHER_INTERVAL_SECONDS` and defaults to `300`.
+
+When a final report appears, the supervisor parses report status fields such as `status: succeeded` or `status: failed`. Failed reports mark the parent task as failed instead of treating any non-empty report as success. Completion messages are formatted for phone reading: result first, scope second, and at most three key evidence points.
 
 ## Runtime Layout
 
