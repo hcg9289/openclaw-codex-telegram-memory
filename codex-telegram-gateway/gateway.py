@@ -34,10 +34,12 @@ MEMORY_DIR = STATE_DIR / "memory"
 OFFSET_FILE = STATE_DIR / "offset.txt"
 RECENT_MESSAGES_FILE = MEMORY_DIR / "recent_messages.jsonl"
 LAST_CONTEXT_FILE = MEMORY_DIR / "last_context.json"
+PENDING_MESSAGE_BATCHES_FILE = STATE_DIR / "pending_message_batches.json"
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
 MAX_MESSAGE = 3900
 MAX_RECENT_TURNS = int(os.environ.get("MAX_RECENT_TURNS", "20"))
 MAX_ACTIVE_WORK_TASKS = int(os.environ.get("MAX_ACTIVE_WORK_TASKS", "2"))
+MESSAGE_BATCH_DELAY_SECONDS = float(os.environ.get("MESSAGE_BATCH_DELAY_SECONDS", "8"))
 STOP = False
 
 
@@ -96,6 +98,28 @@ def write_offset(offset):
     tmp = OFFSET_FILE.with_suffix(".tmp")
     tmp.write_text(str(offset), encoding="utf-8")
     os.replace(tmp, OFFSET_FILE)
+
+
+def atomic_write_json(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        memory_adapter.redact_secrets(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+    os.chmod(path, mode)
+
+
+def read_json(path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return default
 
 
 def _jsonl_append(path, item):
@@ -395,6 +419,86 @@ def launch_task(task):
             return False, result.stdout or ""
         return True, result.stdout or ""
     return False, "queued because max active work tasks reached"
+
+
+def create_and_launch_task_from_text(user_text, chat_id, user_id, batch_count=1):
+    append_recent("user", user_text, chat_id, user_id)
+    task = task_store.create_task(user_text, chat_id, user_id)
+    launch_task(task)
+    status = (task_store.get_task(task["task_id"]) or task).get("status")
+    batch_note = f"\n合併段數：{batch_count}" if batch_count > 1 else ""
+    send_message(
+        chat_id,
+        f"已建立 background Codex task：{task.get('title')}\n"
+        f"task_id：{task.get('task_id')}\n"
+        f"狀態：{status}{batch_note}\n"
+        f"你可以繼續對話；要查進度可直接問，或用 /task <task_id>。",
+    )
+    return task
+
+
+def _pending_batch_key(chat_id, user_id):
+    return f"{chat_id}:{user_id}"
+
+
+def load_pending_message_batches():
+    data = read_json(PENDING_MESSAGE_BATCHES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_pending_message_batches(batches):
+    if batches:
+        atomic_write_json(PENDING_MESSAGE_BATCHES_FILE, batches)
+        return
+    if PENDING_MESSAGE_BATCHES_FILE.exists():
+        PENDING_MESSAGE_BATCHES_FILE.unlink()
+
+
+def enqueue_user_task_message(safe_text, chat_id, user_id):
+    now = time.time()
+    key = _pending_batch_key(chat_id, user_id)
+    batches = load_pending_message_batches()
+    batch = batches.get(key) or {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "segments": [],
+        "created_at": now,
+        "last_update_at": now,
+        "deadline": now + MESSAGE_BATCH_DELAY_SECONDS,
+    }
+    batch["segments"].append(safe_text)
+    batch["last_update_at"] = now
+    batch["deadline"] = now + MESSAGE_BATCH_DELAY_SECONDS
+    batches[key] = batch
+    save_pending_message_batches(batches)
+
+def flush_due_pending_message_batches(force=False):
+    now = time.time()
+    batches = load_pending_message_batches()
+    if not batches:
+        return
+    remaining = {}
+    for key, batch in batches.items():
+        deadline = float(batch.get("deadline") or 0)
+        if not force and deadline > now:
+            remaining[key] = batch
+            continue
+        segments = [str(item).strip() for item in batch.get("segments") or [] if str(item).strip()]
+        if not segments:
+            continue
+        user_text = "\n\n".join(segments)
+        create_and_launch_task_from_text(user_text, batch.get("chat_id"), batch.get("user_id"), batch_count=len(segments))
+    save_pending_message_batches(remaining)
+
+
+def next_pending_message_deadline():
+    deadlines = []
+    for batch in load_pending_message_batches().values():
+        try:
+            deadlines.append(float(batch.get("deadline")))
+        except Exception:
+            continue
+    return min(deadlines) if deadlines else None
 
 
 def format_tasks():
@@ -698,18 +802,7 @@ def handle_message(message):
     if memory_adapter.contains_secret(text):
         send_message(chat_id, "偵測到疑似 secret，已遮蔽後處理，且不會寫入長期記憶。")
 
-    recent_context = format_recent_context()
-    append_recent("user", safe_text, chat_id, user_id)
-    task = task_store.create_task(safe_text, chat_id, user_id)
-    launched, detail = launch_task(task)
-    status = (task_store.get_task(task["task_id"]) or task).get("status")
-    send_message(
-        chat_id,
-        f"已建立 background Codex task：{task.get('title')}\n"
-        f"task_id：{task.get('task_id')}\n"
-        f"狀態：{status}\n"
-        f"你可以繼續對話；要查進度可直接問，或用 /task <task_id>。",
-    )
+    enqueue_user_task_message(safe_text, chat_id, user_id)
 
 
 def main():
@@ -724,10 +817,15 @@ def main():
     polling_timeout_count = 0
     while not STOP:
         try:
-            params = {"timeout": 30, "allowed_updates": json.dumps(["message"])}
+            flush_due_pending_message_batches()
+            poll_timeout = 30
+            deadline = next_pending_message_deadline()
+            if deadline is not None:
+                poll_timeout = max(1, min(30, int(deadline - time.time()) + 1))
+            params = {"timeout": poll_timeout, "allowed_updates": json.dumps(["message"])}
             if offset is not None:
                 params["offset"] = offset
-            updates = api_call("getUpdates", params, timeout=40)
+            updates = api_call("getUpdates", params, timeout=poll_timeout + 10)
             polling_timeout_count = 0
             for update in updates:
                 update_id = update["update_id"]
@@ -735,16 +833,19 @@ def main():
                 write_offset(offset)
                 if "message" in update:
                     handle_message(update["message"])
+            flush_due_pending_message_batches()
         except Exception as exc:
             if is_polling_timeout(exc):
                 polling_timeout_count += 1
                 if polling_timeout_count == 1 or polling_timeout_count % 20 == 0:
                     print(f"gateway polling timeout: retrying count={polling_timeout_count}", flush=True)
+                flush_due_pending_message_batches()
                 time.sleep(1)
                 continue
             print(f"gateway error: {exc}", flush=True)
             time.sleep(5)
 
+    flush_due_pending_message_batches(force=True)
     print("Codex Telegram Gateway stopped", flush=True)
 
 

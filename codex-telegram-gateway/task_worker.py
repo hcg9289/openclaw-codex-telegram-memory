@@ -89,6 +89,9 @@ If evidence is insufficient, say so instead of doing extra work.
 - 如需證據，最多列 3 個短項目；避免大段 code block 或 JSON。
 - 對進度/巡檢回覆，必須包含目前進度、完成百分比；資料足夠時估 ETA，資料不足時明講不能估。
 - task_id 由 gateway 放在訊息最後，你的正文不用重複 task_id。
+- 任務完成後的正文必須按第一性原理寫：先回答「是否成功/失敗/仍需觀察」，再說「這個判定的適用範圍」，最後才放最多 3 條能支撐判定的依據。
+- 不要使用「人話結論」「證據」「使用 Skill」這類標籤；直接用自然語言和短項目。
+- 不要貼半截 log、內部事件名長串、JSON tail、或超過 3 條的證據清單；需要細節時只給檔案路徑或說明可再查。
 [/TELEGRAM_REPLY_STYLE]
 
 [ENGINEERING_OWNER_PROTOCOL]

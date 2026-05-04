@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
+import calendar
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -38,7 +40,7 @@ import telegram_sender  # noqa: E402
 POLL_SECONDS = int(os.environ.get("TASK_SUPERVISOR_INTERVAL_SECONDS", "60"))
 TASK_STALE_SECONDS = int(os.environ.get("TASK_STALE_SECONDS", "900"))
 WATCH_STALE_SECONDS = int(os.environ.get("WATCH_STALE_SECONDS", "900"))
-SUPERVISION_COOLDOWN_SECONDS = int(os.environ.get("SUPERVISION_COOLDOWN_SECONDS", "900"))
+SUPERVISION_COOLDOWN_SECONDS = int(os.environ.get("SUPERVISION_COOLDOWN_SECONDS", "300"))
 CODEX_WATCHER_INTERVAL_SECONDS = int(os.environ.get("CODEX_WATCHER_INTERVAL_SECONDS", "300"))
 MAX_SUPERVISION_TASKS_PER_PARENT = int(os.environ.get("MAX_SUPERVISION_TASKS_PER_PARENT", "3"))
 MAX_ACTIVE_WORK_TASKS = int(os.environ.get("MAX_ACTIVE_WORK_TASKS", "2"))
@@ -57,7 +59,7 @@ def parse_ts(value):
     if not value:
         return 0.0
     try:
-        return time.mktime(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ"))
+        return float(calendar.timegm(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")))
     except Exception:
         return 0.0
 
@@ -87,6 +89,20 @@ def file_nonempty(path):
         return False
 
 
+def file_snapshot(path):
+    if not path:
+        return None
+    try:
+        stat = Path(path).stat()
+        return {
+            "path": str(path),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+        }
+    except Exception:
+        return None
+
+
 def read_text_tail(path, limit=3000):
     if not path:
         return ""
@@ -94,6 +110,28 @@ def read_text_tail(path, limit=3000):
         return memory_adapter.redact_secrets(Path(path).read_text(encoding="utf-8", errors="replace")[-limit:])
     except Exception:
         return ""
+
+
+def parse_final_report_status(text):
+    report = text or ""
+    status = None
+    failure_reason = None
+    for raw_line in report.splitlines()[:80]:
+        line = raw_line.strip()
+        match = re.match(r"[-*]?\s*status\s*:\s*([A-Za-z0-9_.-]+)\s*$", line, re.IGNORECASE)
+        if match:
+            status = match.group(1).strip().lower()
+            continue
+        match = re.match(r"[-*]?\s*failure_reason\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if match:
+            failure_reason = match.group(1).strip()
+    if status in {"failed", "failure", "error", "cancelled", "canceled"}:
+        return "failed", failure_reason or status
+    if failure_reason and failure_reason.lower() not in {"none", "null", "n/a", "-"}:
+        return "failed", failure_reason
+    if status in {"succeeded", "success", "completed", "complete", "done"}:
+        return "succeeded", None
+    return "unknown", failure_reason
 
 
 def read_json_file(path):
@@ -240,6 +278,216 @@ def unit_active(unit_name):
         check=False,
     )
     return result.stdout.strip() == "active"
+
+
+def unit_control_group(unit_name):
+    if not unit_name:
+        return ""
+    unit = str(unit_name)
+    if not unit.endswith(".service"):
+        unit = unit + ".service"
+    result = subprocess.run(
+        ["systemctl", "show", unit, "-p", "ControlGroup", "--value", "--no-pager"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return (result.stdout or "").strip()
+
+
+def unit_process_snapshot(unit_name):
+    control_group = unit_control_group(unit_name)
+    if not control_group:
+        return []
+    procs_file = Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+    try:
+        pids = [int(raw.strip()) for raw in procs_file.read_text(encoding="utf-8", errors="replace").splitlines() if raw.strip()]
+    except Exception:
+        return []
+    if not pids:
+        return []
+    result = subprocess.run(
+        ["ps", "-o", "pid=,ppid=,comm=,args=", "-p", ",".join(str(pid) for pid in pids)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except Exception:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "comm": parts[2],
+                "cmd": parts[3] if len(parts) >= 4 else "",
+            }
+        )
+    return rows
+
+
+def process_is_codex_or_worker(row, task_id):
+    cmd = row.get("cmd", "")
+    comm = row.get("comm", "")
+    needle = str(task_id or "")
+    if "task_worker.py" in cmd and (not needle or needle in cmd):
+        return True
+    if comm in {"codex", "node"}:
+        if " codex exec " in f" {cmd} " or "/codex exec " in cmd or comm == "codex":
+            return True
+    return False
+
+
+def task_has_codex_process(task):
+    if isinstance(task, dict):
+        task_id = task.get("task_id")
+        unit_name = task.get("unit_name")
+        unit_rows = unit_process_snapshot(unit_name)
+        if any(process_is_codex_or_worker(row, task_id) for row in unit_rows):
+            return True
+    else:
+        task_id = task
+        unit_rows = []
+    if not task_id:
+        return False
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,comm=,cmd="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    rows = {}
+    children = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except Exception:
+            continue
+        comm = parts[2]
+        cmd = parts[3]
+        rows[pid] = {"ppid": ppid, "comm": comm, "cmd": cmd}
+        children.setdefault(ppid, []).append(pid)
+
+    needle = str(task_id)
+    roots = [
+        pid
+        for pid, row in rows.items()
+        if "task_worker.py" in row["cmd"] and needle in row["cmd"]
+    ]
+    if not roots:
+        return False
+
+    stack = list(roots)
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        row = rows.get(pid) or {}
+        cmd = row.get("cmd", "")
+        comm = row.get("comm", "")
+        if process_is_codex_or_worker({"cmd": cmd, "comm": comm}, task_id):
+            return True
+        stack.extend(children.get(pid, []))
+    return False
+
+
+def stop_task_unit(task):
+    unit_name = task.get("unit_name") if isinstance(task, dict) else None
+    if not unit_name:
+        return False
+    unit = str(unit_name)
+    if not unit.endswith(".service"):
+        unit = unit + ".service"
+    subprocess.run(
+        ["systemctl", "stop", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    return True
+
+
+def candidate_output_dirs(task_id, task):
+    texts = [
+        task.get("user_text") if isinstance(task, dict) else "",
+        task_store.read_task_text(task_id, "prompt.md", limit_chars=60000),
+        task_store.read_task_text(task_id, "stdout.log", limit_chars=20000),
+    ]
+    dirs = []
+    seen = set()
+    for text in texts:
+        for match in re.finditer(r"--output-dir\s+([^\s\"']+)", text or ""):
+            value = match.group(1).strip()
+            if value and value not in seen:
+                dirs.append(Path(value))
+                seen.add(value)
+        for match in re.finditer(r"(/[^\s\"']+/output[^\s\"']*)", text or ""):
+            value = match.group(1).rstrip(".,)")
+            if value and value not in seen:
+                dirs.append(Path(value))
+                seen.add(value)
+    return dirs
+
+
+def infer_final_report(task):
+    task_id = task.get("task_id")
+    watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
+    if isinstance(watch, dict):
+        explicit = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
+        if file_nonempty(explicit):
+            return str(explicit), {"source": "watch.json"}
+
+    for out_dir in candidate_output_dirs(task_id, task):
+        if not out_dir.exists() or not out_dir.is_dir():
+            continue
+        summary = out_dir / "final_falsification_summary.json"
+        data = read_json_file(summary)
+        if isinstance(data, dict):
+            paths = data.get("paths") or {}
+            for key in (
+                "final_grid_falsification_report_md",
+                "final_grid_falsification_report_html",
+                "report_md",
+                "diagnostic_report_md",
+                "final_combination_summary_md",
+            ):
+                path = paths.get(key)
+                if file_nonempty(path):
+                    return str(path), {"source": str(summary), "key": key}
+        for name in (
+            "final_grid_falsification_report_zh.md",
+            "diagnostic_report_zh.md",
+            "final_combination_summary_zh.md",
+            "ablation_summary_zh.md",
+        ):
+            path = out_dir / name
+            if file_nonempty(path):
+                return str(path), {"source": "output_dir", "output_dir": str(out_dir), "name": name}
+    return None, {}
 
 
 def supervision_state(task_id):
@@ -402,6 +650,8 @@ reason={reason}
 - 第一段必須包含：目前是否正常、完成百分比、ETA 或「暫時不能估算」。
 - 後面最多 3 個短項目：進度、證據、下一次要看什麼。
 - 不要貼大段 JSON、不要長 code block、不要像審計報告。
+- 任務完成/失敗的正文必須按第一性原理寫：先回答「是否成功/失敗/仍需觀察」，再說「這個判定的適用範圍」，最後最多 3 條關鍵依據。
+- 不要使用「人話結論」「證據」「使用 Skill」這類標籤；不要貼半截 log、內部事件名長串或 final_report tail。
 
 這是 watcher，不是新任務；不要擴大範圍。
 """
@@ -438,28 +688,75 @@ def append_main_recent(task, text):
         task_store.append_event(task.get("task_id"), "main_recent_append_failed", {"error": f"{type(exc).__name__}: {exc}"})
 
 
+def extract_report_field(text, field):
+    if not text:
+        return None
+    pattern = re.compile(rf"[-*]?\s*{re.escape(field)}\s*:\s*(.+?)\s*$", re.IGNORECASE)
+    for raw_line in text.splitlines()[:120]:
+        match = pattern.match(raw_line.strip())
+        if match:
+            value = match.group(1).strip()
+            if value and value.lower() not in {"none", "null", "n/a", "-"}:
+                return value
+    return None
+
+
+def build_watched_completion_message(task, report_path, report_tail, final_status, failure_reason):
+    title = task.get("title") or "background task"
+    duration = extract_report_field(report_tail, "duration_seconds") or extract_report_field(report_tail, "elapsed_seconds")
+    scope = "這個判定只代表這個已登記的 background runner 路徑，不代表其他未驗證長任務也一定穩定。"
+    if final_status == "failed":
+        reason = failure_reason or extract_report_field(report_tail, "failure_reason") or "final report 標記 failed"
+        first = f"這次任務失敗；supervisor 已讀到 final report，失敗原因是：{reason}。"
+    else:
+        if duration:
+            first = f"這次任務成功；supervisor 已讀到 final report，runner 實跑 {duration} 秒後完成。"
+        else:
+            first = "這次任務成功；supervisor 已讀到 final report 並完成收尾。"
+
+    points = [
+        f"任務：{title}",
+        f"final report：{report_path}",
+        f"supervisor 判定：{final_status}",
+    ]
+    if final_status == "failed" and failure_reason:
+        points[2] = f"失敗原因：{failure_reason}"
+
+    return first + "\n" + scope + "\n\n" + "\n".join(f"- {point}" for point in points)
+
+
 def finalize_watched_task(task, watch):
     task_id = task["task_id"]
     report_path = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
     report_tail = read_text_tail(report_path, limit=5000)
-    text = (
-        "任務完成：supervisor 已偵測到 final report。\n\n"
-        f"父 task：{task.get('title')}\n"
-        f"task_id：{task_id}\n"
-        f"final_report：{report_path}\n\n"
-        f"{report_tail or '(final report exists but could not be read)'}"
-    )
+    report_status, failure_reason = parse_final_report_status(report_tail)
+    final_status = "failed" if report_status == "failed" else "succeeded"
+    text = build_watched_completion_message(task, report_path, report_tail, final_status, failure_reason)
     safe = memory_adapter.redact_secrets(text)
     task_store.write_task_text(task_id, "result.md", safe)
-    task_store.update_task(task_id, status="succeeded", error=None, supervisor_completed_at=task_store.utc_now())
+    task_store.update_task(task_id, status=final_status, error=failure_reason if final_status == "failed" else None, supervisor_completed_at=task_store.utc_now())
     task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe, {"source": "supervisor_finalized"})
-    task_store.append_event(task_id, "supervisor_finalized", {"final_report": report_path})
+    task_store.append_event(task_id, "supervisor_finalized", {"final_report": report_path, "final_status": final_status, "failure_reason": failure_reason})
     released = task_store.release_resource_locks_for_task(task_id, reason="supervisor_finalized")
     if released:
         task_store.append_event(task_id, "resource_locks_released", {"resource_keys": released})
-    append_main_recent(task, f"任務已完成：{task.get('title')}\ntask_id：{task_id}\nfinal_report：{report_path}")
+    if task.get("unit_name") and unit_active(task.get("unit_name")):
+        if stop_task_unit(task):
+            task_store.append_event(task_id, "task_unit_stopped_after_supervisor_finalized", {"unit_name": task.get("unit_name")})
+    if final_status == "failed":
+        append_main_recent(task, f"任務已失敗：{task.get('title')}\ntask_id：{task_id}\nfinal_report：{report_path}\nfailure_reason：{failure_reason}")
+    else:
+        append_main_recent(task, f"任務已完成：{task.get('title')}\ntask_id：{task_id}\nfinal_report：{report_path}")
     if task.get("chat_id"):
         telegram_sender.send_message(task.get("chat_id"), safe)
+
+
+def finalize_inferred_task(task, report_path, detector=None):
+    watch = {
+        "final_report": report_path,
+        "detector": detector or {},
+    }
+    finalize_watched_task(task, watch)
 
 
 def inspect_watch(task):
@@ -506,6 +803,7 @@ def inspect_watch(task):
         watch.get("stderr_file"),
         watch.get("stdout_file"),
     ]
+    snapshots = [snapshot for snapshot in (file_snapshot(path) for path in paths) if snapshot is not None]
     ages = [age for age in (file_age(path) for path in paths) if age is not None]
     freshest_age = min(ages) if ages else None
     stale_after = int(watch.get("stale_after_seconds") or WATCH_STALE_SECONDS)
@@ -516,6 +814,9 @@ def inspect_watch(task):
     state["pid"] = pid
     state["pid_alive"] = alive
     state["freshest_file_age_seconds"] = round(freshest_age, 2) if freshest_age is not None else None
+    previous_snapshots = state.get("watch_file_snapshots") if isinstance(state.get("watch_file_snapshots"), list) else []
+    state["watch_files_changed"] = snapshots != previous_snapshots
+    state["watch_file_snapshots"] = snapshots
     progress = progress_metrics(watch, state)
     state["progress"] = progress
     write_supervision_state(task_id, state)
@@ -531,12 +832,13 @@ def inspect_watch(task):
                 "stale_after_seconds": stale_after,
                 "final_report_exists": file_nonempty(final_report),
                 "progress": progress,
+                "watch_files_changed": state["watch_files_changed"],
                 "watch": watch,
             },
             ensure_ascii=False,
             indent=2,
         )
-        spawn_periodic_watch_task(task_store.get_task(task_id) or task, "periodic_codex_watch", evidence)
+        task_store.append_event(task_id, "watch_progress_fresh", json.loads(evidence))
         return
 
     evidence = json.dumps(
@@ -547,6 +849,7 @@ def inspect_watch(task):
             "stale_after_seconds": stale_after,
             "final_report_exists": file_nonempty(final_report),
             "progress": progress,
+            "watch_files_changed": state.get("watch_files_changed"),
             "watch": watch,
         },
         ensure_ascii=False,
@@ -581,8 +884,84 @@ def inspect_active_task(task):
         return
 
     if status in {"starting", "running", "finalizing"}:
+        inferred_report, detector = infer_final_report(task)
+        if inferred_report:
+            task_store.append_event(task_id, "inferred_final_report_detected", {"final_report": inferred_report, "detector": detector})
+            finalize_inferred_task(task, inferred_report, detector)
+            return
         active = unit_active(task.get("unit_name"))
         if active is True:
+            codex_running = task_has_codex_process(task)
+            state = supervision_state(task_id)
+            state["last_active_unit_check_at"] = task_store.utc_now()
+            state["unit_active"] = True
+            state["codex_running"] = codex_running
+            if codex_running:
+                state.pop("no_codex_since_ts", None)
+                state.pop("no_codex_since_at", None)
+                state.pop("no_codex_elapsed_seconds", None)
+                state.pop("watch_json_present", None)
+                write_supervision_state(task_id, state)
+                return
+
+            watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
+            if isinstance(watch, dict) and watch.get("enabled", False):
+                state.pop("no_codex_since_ts", None)
+                state.pop("no_codex_since_at", None)
+                state.pop("no_codex_elapsed_seconds", None)
+                state["watch_json_present"] = True
+                write_supervision_state(task_id, state)
+                inspect_watch(task)
+                return
+
+            now = time.time()
+            no_codex_since = float(state.get("no_codex_since_ts") or 0)
+            if no_codex_since <= 0:
+                state["no_codex_since_ts"] = now
+                state["no_codex_since_at"] = task_store.utc_now()
+                state["watch_json_present"] = False
+                write_supervision_state(task_id, state)
+                task_store.append_event(
+                    task_id,
+                    "codex_absent_without_watch_timer_started",
+                    {"interval_seconds": CODEX_WATCHER_INTERVAL_SECONDS},
+                )
+                return
+            no_codex_elapsed = max(0.0, now - no_codex_since)
+            state["no_codex_elapsed_seconds"] = round(no_codex_elapsed, 2)
+            state["watch_json_present"] = False
+            write_supervision_state(task_id, state)
+            if no_codex_elapsed < CODEX_WATCHER_INTERVAL_SECONDS:
+                return
+
+            if task_has_codex_process(task):
+                state = supervision_state(task_id)
+                state["codex_running"] = True
+                state.pop("no_codex_since_ts", None)
+                state.pop("no_codex_since_at", None)
+                state.pop("no_codex_elapsed_seconds", None)
+                write_supervision_state(task_id, state)
+                task_store.append_event(task_id, "codex_watch_suppressed_codex_reappeared", {})
+                return
+
+            evidence = json.dumps(
+                {
+                    "status": status,
+                    "unit_name": task.get("unit_name"),
+                    "unit_active": active,
+                    "codex_running": codex_running,
+                    "updated_at": task.get("updated_at"),
+                    "age_seconds": round(age_seconds(task.get("updated_at")), 2),
+                    "no_codex_since_at": state.get("no_codex_since_at"),
+                    "no_codex_elapsed_seconds": round(no_codex_elapsed, 2),
+                    "watch_json_present": False,
+                    "stdout_tail": task_store.read_task_text(task_id, "stdout.log", limit_chars=2000),
+                    "stderr_tail": task_store.read_task_text(task_id, "stderr.log", limit_chars=2000),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            spawn_supervision_task(task, "codex_absent_without_watch", evidence)
             return
         if age_seconds(task.get("updated_at")) <= TASK_STALE_SECONDS:
             return
