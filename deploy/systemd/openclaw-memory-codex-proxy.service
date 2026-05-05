@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenClaw Memory Codex OpenAI-compatible proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+Environment=CODEX_PROXY_HOST=127.0.0.1
+Environment=CODEX_PROXY_PORT=18082
+Environment=CODEX_PROXY_MODEL=gpt-5.5
+Environment=CODEX_PROXY_REASONING_EFFORT=high
+Environment=CODEX_BIN=/usr/bin/codex
+Environment=CODEX_WORKDIR=/root
+Environment=CODEX_PROXY_REQUEST_TIMEOUT=900
+ExecStart=/usr/bin/python3 /opt/openclaw-memory/scripts/codex_openai_proxy.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=false
+ReadWritePaths=/opt/openclaw-memory/logs /tmp /root/.codex
+StandardOutput=append:/opt/openclaw-memory/logs/codex_proxy.log
+StandardError=append:/opt/openclaw-memory/logs/codex_proxy.log
+
+[Install]
+WantedBy=multi-user.target

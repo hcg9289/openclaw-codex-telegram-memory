@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex Telegram Gateway Memory Writer
+After=network-online.target codex-telegram-gateway.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/codex-telegram-gateway
+EnvironmentFile=-/opt/codex-telegram-gateway/.env
+ExecStart=/usr/bin/python3 /opt/codex-telegram-gateway/memory_writer.py --once --limit 20
+NoNewPrivileges=true
+PrivateTmp=true
+

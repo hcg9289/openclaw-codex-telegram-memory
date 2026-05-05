@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Codex Telegram Gateway Memory Curator periodically
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=300s
+AccuracySec=30s
+Unit=codex-telegram-memory-curator.service
+
+[Install]
+WantedBy=timers.target
+
