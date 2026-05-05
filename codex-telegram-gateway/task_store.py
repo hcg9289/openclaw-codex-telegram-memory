@@ -194,6 +194,43 @@ def write_task_json(task_id, filename, data):
     write_json(task_dir(task_id) / filename, data)
 
 
+def default_goal_state(task):
+    task = task or {}
+    return {
+        "goal": task.get("user_text") or task.get("title") or "",
+        "scope": "Do exactly what the Telegram user asked; do not expand scope.",
+        "completion_criteria": [
+            "Answer the user directly, or complete the requested task with evidence.",
+            "If this becomes long-running work, register watch.json before exiting.",
+            "If the task cannot be completed safely, explain the blocker and next required input.",
+        ],
+        "status": "active",
+        "next_action": None,
+        "last_progress": None,
+        "completion_evidence": None,
+        "needs_user_input": False,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+
+
+def ensure_goal_state(task_id, task=None):
+    existing = read_task_json(task_id, "goal_state.json", default=None)
+    if isinstance(existing, dict) and existing:
+        return existing
+    state = default_goal_state(task or get_task(task_id))
+    write_task_json(task_id, "goal_state.json", state)
+    return state
+
+
+def update_goal_state(task_id, **fields):
+    state = ensure_goal_state(task_id)
+    state.update(fields)
+    state["updated_at"] = utc_now()
+    write_task_json(task_id, "goal_state.json", state)
+    return state
+
+
 def _path_token(value):
     if not value:
         return ""
@@ -364,6 +401,18 @@ def task_context(task_id, limit_chars=12000):
         "[supervisor_state]",
         json.dumps(read_task_json(task_id, "supervisor_state.json", default={}) or {}, ensure_ascii=False, indent=2),
         "[/supervisor_state]",
+        "",
+        "[session_json]",
+        json.dumps(read_task_json(task_id, "session.json", default={}) or {}, ensure_ascii=False, indent=2),
+        "[/session_json]",
+        "",
+        "[goal_state]",
+        json.dumps(read_task_json(task_id, "goal_state.json", default={}) or {}, ensure_ascii=False, indent=2),
+        "[/goal_state]",
+        "",
+        "[resume_events_tail]",
+        read_jsonl_tail(task_id, "resume_events.jsonl", limit=20) or "(empty)",
+        "[/resume_events_tail]",
         "",
         "[events_tail]",
         read_events_tail(task_id, limit=20) or "(empty)",

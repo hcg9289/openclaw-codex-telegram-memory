@@ -5,7 +5,6 @@ import signal
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +14,7 @@ from pathlib import Path
 import facts_store
 import job_store
 import memory_adapter
+import memory_queue
 import orchestrator
 import router
 import task_store
@@ -33,6 +33,7 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "/var/lib/codex-telegram-gateway"))
 MEMORY_DIR = STATE_DIR / "memory"
 OFFSET_FILE = STATE_DIR / "offset.txt"
 RECENT_MESSAGES_FILE = MEMORY_DIR / "recent_messages.jsonl"
+SUPERVISOR_RECENT_FILE = MEMORY_DIR / "supervisor_recent.jsonl"
 LAST_CONTEXT_FILE = MEMORY_DIR / "last_context.json"
 PENDING_MESSAGE_BATCHES_FILE = STATE_DIR / "pending_message_batches.json"
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
@@ -151,25 +152,105 @@ def _trim_recent_messages():
     os.replace(tmp, RECENT_MESSAGES_FILE)
 
 
-def append_recent(role, text, chat_id, user_id):
+def kick_memory_writer():
+    subprocess.Popen(
+        ["/usr/bin/python3", "/opt/codex-telegram-gateway/memory_writer.py", "--once", "--limit", "10"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd="/opt/codex-telegram-gateway",
+    )
+
+
+def kick_memory_curator():
+    subprocess.Popen(
+        ["/usr/bin/python3", "/opt/codex-telegram-gateway/memory_curator.py", "--once", "--limit", "1"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd="/opt/codex-telegram-gateway",
+    )
+
+
+def _maybe_create_conversation_batch():
+    with memory_queue.recent_state_lock():
+        state = memory_queue.read_recent_state()
+        last_batched_seq = int(state.get("last_batched_seq") or 0)
+        items = [
+            item
+            for item in _read_jsonl(RECENT_MESSAGES_FILE)
+            if isinstance(item.get("seq"), int)
+            and item.get("seq", 0) > last_batched_seq
+            and item.get("role") in {"user", "assistant"}
+        ]
+        assistant_seen = 0
+        cutoff_seq = None
+        for item in items:
+            if item.get("role") == "assistant":
+                assistant_seen += 1
+                if assistant_seen >= MAX_RECENT_TURNS:
+                    cutoff_seq = item.get("seq")
+                    break
+        if cutoff_seq is None:
+            return None
+        batch_items = [item for item in items if item.get("seq", 0) <= cutoff_seq]
+        if not batch_items:
+            return None
+        related_task_ids = [
+            (item.get("metadata") or {}).get("task_id")
+            for item in batch_items
+            if isinstance(item.get("metadata"), dict)
+        ]
+        batch = memory_queue.create_conversation_batch(
+            batch_items,
+            related_task_ids=related_task_ids,
+            from_seq=batch_items[0].get("seq"),
+            to_seq=cutoff_seq,
+        )
+    kick_memory_curator()
+    return batch
+
+
+def append_recent(role, text, chat_id, user_id, metadata=None):
     safe_text = memory_adapter.redact_secrets(text)
+    metadata = metadata or {}
+    if metadata.get("source") in {"supervisor", "legacy_job"}:
+        _jsonl_append(
+            SUPERVISOR_RECENT_FILE,
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "role": role,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "text": safe_text,
+                "metadata": metadata,
+            },
+        )
+        return None
+    seq = memory_queue.next_recent_seq()
     _jsonl_append(
         RECENT_MESSAGES_FILE,
         {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "seq": seq,
             "role": role,
             "chat_id": chat_id,
             "user_id": user_id,
             "text": safe_text,
+            "metadata": metadata,
         },
     )
     _trim_recent_messages()
+    if role == "assistant":
+        return _maybe_create_conversation_batch()
+    return None
 
 
 def clear_recent_memory():
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     RECENT_MESSAGES_FILE.write_text("", encoding="utf-8")
     LAST_CONTEXT_FILE.write_text("{}", encoding="utf-8")
+    memory_queue.write_recent_state({"next_seq": 1, "last_batched_seq": 0})
 
 
 def format_recent_context(limit_turns=MAX_RECENT_TURNS):
@@ -271,13 +352,8 @@ def direct_answer(user_text, chat_id, user_id, recent_context):
     save_last_context(chat_id, user_id, recall_result)
     answer = memory_adapter.redact_secrets(run_codex(build_prompt(user_text, recall_text, recent_context)))
     send_message(chat_id, answer)
-    append_recent("user", user_text, chat_id, user_id)
-    append_recent("assistant", answer, chat_id, user_id)
-    if should_auto_remember(user_text, answer):
-        remember_async(
-            f"Telegram direct answer:\nUser: {user_text}\nAssistant: {answer}",
-            {"source": "telegram_direct", "chat_id": chat_id, "user_id": user_id},
-        )
+    append_recent("user", user_text, chat_id, user_id, metadata={"source": "telegram_direct"})
+    append_recent("assistant", answer, chat_id, user_id, metadata={"source": "telegram_direct"})
     return answer
 
 
@@ -343,13 +419,12 @@ def should_auto_remember(user_text, answer):
 
 
 def remember_async(text, metadata):
-    def _worker():
-        result = memory_adapter.remember_fact(text, metadata=metadata, session_id=str(metadata.get("chat_id")))
-        if not result.get("ok"):
-            print(f"memory remember skipped/failed: {result}", flush=True)
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
+    result = memory_queue.enqueue_memory(text, metadata=metadata, source=(metadata or {}).get("source") or "telegram")
+    if result.get("ok"):
+        kick_memory_writer()
+    else:
+        print(f"memory enqueue skipped/failed: {result}", flush=True)
+    return result
 
 
 def save_last_context(chat_id, user_id, recall_result):
@@ -370,6 +445,7 @@ def save_last_context(chat_id, user_id, recall_result):
 
 def format_memory_status():
     status = memory_adapter.memory_status()
+    status.update(memory_queue.queue_status())
     status["facts_file"] = str(facts_store.FACTS_FILE)
     status["facts_events_file"] = str(facts_store.EVENTS_FILE)
     status["current_facts_count"] = len(facts_store.get_current_facts())
@@ -422,8 +498,8 @@ def launch_task(task):
 
 
 def create_and_launch_task_from_text(user_text, chat_id, user_id, batch_count=1):
-    append_recent("user", user_text, chat_id, user_id)
     task = task_store.create_task(user_text, chat_id, user_id)
+    append_recent("user", user_text, chat_id, user_id, metadata={"source": "telegram_task", "task_id": task["task_id"]})
     launch_task(task)
     status = (task_store.get_task(task["task_id"]) or task).get("status")
     batch_note = f"\n合併段數：{batch_count}" if batch_count > 1 else ""
@@ -520,7 +596,13 @@ def _task_id_from_command(text, command):
 
 
 def finish_job_callback(job, final_report):
-    append_recent("assistant", memory_adapter.redact_secrets(final_report), job.get("chat_id"), job.get("user_id"))
+    append_recent(
+        "assistant",
+        memory_adapter.redact_secrets(final_report),
+        job.get("chat_id"),
+        job.get("user_id"),
+        metadata={"source": "legacy_job", "job_id": job.get("job_id")},
+    )
 
 
 def handle_job_route(chat_id, route_result):
@@ -786,16 +868,14 @@ def handle_message(message):
         if not fact:
             send_message(chat_id, "用法：/remember <要寫入長期記憶的內容>")
             return
-        result = memory_adapter.remember_fact(
+        result = remember_async(
             fact,
-            metadata={"source": "telegram_manual", "chat_id": chat_id, "user_id": user_id},
-            session_id=str(chat_id),
-            timeout=180,
+            {"source": "telegram_manual", "chat_id": chat_id, "user_id": user_id},
         )
         if result.get("ok"):
-            send_message(chat_id, "已寫入 cognee 長期記憶。")
+            send_message(chat_id, f"已加入長期記憶寫入隊列。\nmemory_id：{result.get('memory_id')}")
         else:
-            send_message(chat_id, f"未寫入 cognee：{result.get('error') or result}")
+            send_message(chat_id, f"未加入長期記憶隊列：{result.get('error') or result}")
         return
 
     safe_text = memory_adapter.redact_secrets(text)

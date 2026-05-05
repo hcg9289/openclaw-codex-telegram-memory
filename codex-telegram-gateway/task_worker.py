@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
+import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -30,6 +30,7 @@ def main():
     sys.path.insert(0, str(APP_DIR))
 
     import gateway
+    import codex_session
     import memory_adapter
     import task_store
     import telegram_sender
@@ -53,7 +54,6 @@ def main():
     status = "failed"
     returncode = None
     started = time.time()
-    out_path = None
     try:
         referenced = task_store.get_task(parent_task_id) if parent_task_id else task_store.resolve_referenced_task(user_text, exclude_task_id=task_id)
         if parent_task_id:
@@ -68,7 +68,10 @@ def main():
             recall_text = recall_result.get("text") if recall_result.get("ok") else f"(cognee recall failed: {recall_result.get('error')})"
             gateway.save_last_context(chat_id, user_id, recall_result)
 
+        task_store.ensure_goal_state(task_id, task)
+        task_dir_path = task_store.task_dir(task_id)
         task_context = task_store.task_context(referenced["task_id"], limit_chars=12000) if referenced else "(no referenced task context)"
+        goal_state = task_store.ensure_goal_state(task_id, task)
         prompt = gateway.build_prompt(user_text, recall_text, recent_context)
         prompt += f"""
 
@@ -154,6 +157,21 @@ Supervisor child tasks with supervisor_for=<parent_task_id> must not pollute mai
 {task_context}
 [/REFERENCED_TASK_CONTEXT]
 
+[EXTERNAL_GOAL_CONTRACT]
+This task uses an external goal contract because codex exec does not parse native /goal.
+The authoritative goal state is stored at:
+{task_dir_path}/goal_state.json
+
+Current goal_state:
+{json.dumps(goal_state, ensure_ascii=False, indent=2)}
+
+Rules:
+- Treat goal_state as the current task contract.
+- Update task evidence through files in this task folder when appropriate.
+- If current facts conflict with older memory, trust facts.json.
+- If this is a progress/result question, only inspect and explain existing state; do not restart or expand work.
+[/EXTERNAL_GOAL_CONTRACT]
+
 [CURRENT_BACKGROUND_TASK]
 task_id={task_id}
 Write your final Telegram answer as the final response. Do not claim work is complete unless you have evidence.
@@ -161,52 +179,29 @@ Write your final Telegram answer as the final response. Do not claim work is com
 """
         task_store.write_task_text(task_id, "prompt.md", prompt)
 
-        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False) as out_file:
-            out_path = out_file.name
-        cmd = [
-            os.environ.get("CODEX_BIN", "/usr/bin/codex"),
-            "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--skip-git-repo-check",
-            "--output-last-message",
-            out_path,
+        # Every Telegram message is its own external goal/task session.
+        # Cross-task continuity must come from facts/recent/cognee/task context,
+        # not from reusing a chat-level Codex thread.
+        use_chat_session = False
+        session_result = codex_session.run_for_task(
+            task_id,
             prompt,
-        ]
-        completed = subprocess.run(
-            cmd,
-            cwd=os.environ.get("CODEX_WORKDIR", "/root"),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            reason="task_worker",
+            use_chat_session=use_chat_session,
+            chat_id=chat_id,
             timeout=int(os.environ.get("CODEX_TIMEOUT_SECONDS", "18000")),
-            check=False,
         )
-        returncode = completed.returncode
-        stdout_text = memory_adapter.redact_secrets(completed.stdout or "")
-        task_store.write_task_text(task_id, "stdout.log", stdout_text)
-        try:
-            answer = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
-        except FileNotFoundError:
-            answer = ""
-        answer = memory_adapter.redact_secrets(answer)
-        if completed.returncode == 0:
+        returncode = session_result.get("returncode")
+        stdout_text = memory_adapter.redact_secrets(session_result.get("stdout") or "")
+        answer = memory_adapter.redact_secrets(session_result.get("answer") or "")
+        if session_result.get("ok"):
             status = "succeeded"
             result = answer or stdout_text[-6000:] or "(Codex finished without text output)"
         else:
-            result = answer or stdout_text[-6000:] or f"Codex failed with exit code {completed.returncode}."
-    except subprocess.TimeoutExpired:
-        status = "failed"
-        result = f"Codex timed out after {os.environ.get('CODEX_TIMEOUT_SECONDS', '18000')} seconds."
+            result = answer or stdout_text[-6000:] or f"Codex failed with exit code {returncode}."
     except Exception as exc:
         status = "failed"
         result = f"{type(exc).__name__}: {exc}"
-    finally:
-        if out_path:
-            try:
-                os.unlink(out_path)
-            except FileNotFoundError:
-                pass
 
     safe_result = memory_adapter.redact_secrets(result)
     watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
@@ -227,6 +222,12 @@ Write your final Telegram answer as the final response. Do not claim work is com
                 + "[/supervisor]"
             )
             task_store.append_event(task_id, "watch_registered", {"watch": watch, "lock": lock})
+            task_store.update_goal_state(
+                task_id,
+                status="watching",
+                next_action="Supervisor will monitor watch.json and resume this Codex session when judgment is needed.",
+                last_progress="watch.json registered",
+            )
         else:
             status = "blocked_by_resource"
             safe_result = (
@@ -240,6 +241,16 @@ Write your final Telegram answer as the final response. Do not claim work is com
                 + "[/resource_lock]"
             )
             task_store.append_event(task_id, "resource_lock_blocked", {"lock": lock, "owner": owner})
+            task_store.update_goal_state(
+                task_id,
+                status="blocked_by_resource",
+                next_action="Inspect or continue the owner task before starting another runner.",
+                last_progress="resource lock conflict",
+            )
+    elif status == "succeeded":
+        task_store.update_goal_state(task_id, status="succeeded", completion_evidence=safe_result[:2000], needs_user_input=False)
+    else:
+        task_store.update_goal_state(task_id, status=status, completion_evidence=safe_result[:2000], needs_user_input=False)
     task_store.write_task_text(task_id, "stderr.log", "")
     task_store.write_task_text(task_id, "result.md", safe_result)
     task_store.update_task(
@@ -250,6 +261,8 @@ Write your final Telegram answer as the final response. Do not claim work is com
         duration_seconds=round(time.time() - started, 2),
     )
     task_store.append_event(task_id, "finished", {"status": status, "returncode": returncode})
+    if status in task_store.FINAL_STATUSES:
+        codex_session.mark_task_session_finished(task_id, status, reason="task_worker_finished")
 
     if chat_id:
         if parent_task_id:
@@ -286,11 +299,12 @@ Write your final Telegram answer as the final response. Do not claim work is com
             {"child_task_id": task_id, "reason": task.get("supervisor_reason"), "status": status},
         )
     else:
-        gateway.append_recent("assistant", safe_result, chat_id, user_id)
-    if not parent_task_id and gateway.should_auto_remember(user_text, safe_result):
-        gateway.remember_async(
-            f"Telegram background task:\nUser: {user_text}\nAssistant: {safe_result}",
-            {"source": "telegram_task", "chat_id": chat_id, "user_id": user_id, "task_id": task_id},
+        gateway.append_recent(
+            "assistant",
+            safe_result,
+            chat_id,
+            user_id,
+            metadata={"source": "telegram_task", "task_id": task_id, "status": status},
         )
 
     subprocess.run(
