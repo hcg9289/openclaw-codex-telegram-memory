@@ -33,6 +33,7 @@ load_env_file()
 sys.path.insert(0, str(APP_DIR))
 
 import memory_adapter  # noqa: E402
+import codex_session  # noqa: E402
 import task_store  # noqa: E402
 import telegram_sender  # noqa: E402
 
@@ -41,7 +42,7 @@ POLL_SECONDS = int(os.environ.get("TASK_SUPERVISOR_INTERVAL_SECONDS", "60"))
 TASK_STALE_SECONDS = int(os.environ.get("TASK_STALE_SECONDS", "900"))
 WATCH_STALE_SECONDS = int(os.environ.get("WATCH_STALE_SECONDS", "900"))
 SUPERVISION_COOLDOWN_SECONDS = int(os.environ.get("SUPERVISION_COOLDOWN_SECONDS", "300"))
-CODEX_WATCHER_INTERVAL_SECONDS = int(os.environ.get("CODEX_WATCHER_INTERVAL_SECONDS", "300"))
+CODEX_WATCHER_INTERVAL_SECONDS = int(os.environ.get("CODEX_WATCHER_INTERVAL_SECONDS", "600"))
 MAX_SUPERVISION_TASKS_PER_PARENT = int(os.environ.get("MAX_SUPERVISION_TASKS_PER_PARENT", "3"))
 MAX_ACTIVE_WORK_TASKS = int(os.environ.get("MAX_ACTIVE_WORK_TASKS", "2"))
 
@@ -549,6 +550,209 @@ def start_task(task):
     return result.returncode == 0, result.stdout[-1000:]
 
 
+def _has_task_session(task):
+    return bool(codex_session.task_session_id(task.get("task_id")))
+
+
+def build_resume_tick_prompt(task, reason, evidence, final_report=None, final_status=None, failure_reason=None):
+    task_id = task.get("task_id")
+    task_dir_path = task_store.task_dir(task_id)
+    goal_state = task_store.read_task_json(task_id, "goal_state.json", default={}) or {}
+    session_json = task_store.read_task_json(task_id, "session.json", default={}) or {}
+    final_block = ""
+    if final_report:
+        final_block = f"""
+[FINAL_REPORT_DETECTED]
+final_report={final_report}
+parsed_final_status={final_status or "unknown"}
+failure_reason={failure_reason or ""}
+[/FINAL_REPORT_DETECTED]
+"""
+    return f"""你正在同一個 Codex task session 內繼續監護任務，不是新任務。
+
+父 task：
+task_id={task_id}
+title={task.get('title')}
+status={task.get('status')}
+reason={reason}
+
+[SESSION]
+{json.dumps(session_json, ensure_ascii=False, indent=2)}
+[/SESSION]
+
+[GOAL_STATE]
+{json.dumps(goal_state, ensure_ascii=False, indent=2)}
+[/GOAL_STATE]
+
+[SCHEDULER_TICK]
+{evidence}
+[/SCHEDULER_TICK]
+{final_block}
+[TASK_CONTEXT]
+{task_store.task_context(task_id, limit_chars=14000)}
+[/TASK_CONTEXT]
+
+請只處理這個 task 的 goal loop tick：
+1. 你自己讀取 task folder、watch.json、progress/heartbeat、runner log、stderr/stdout、final report；不要依賴 Python 的機械判斷。
+2. 判斷是否完成、仍正常推進、卡住、或明確失敗。
+3. 如果只是進度巡檢，必須給完成百分比；資料足夠才估 ETA，否則直接說暫時不能估。
+4. 如果 final report 已存在，必須讀取並用自然繁體中文總結結果，不要只說檔案存在。
+5. 如果卡住或失敗，先給 root cause 證據，再說下一步補救；不可無腦重跑同一 runner。
+6. 不要啟動第二個相同 runner；必須尊重 resource lock、watch.json、progress/heartbeat。
+
+如果你判斷任務狀態需要更新，請寫入：
+{task_dir_path}/watch_decision.json
+
+JSON schema:
+{{
+  "status": "watching | needs_attention | succeeded | failed",
+  "reason": "short reason",
+  "progress_percent": 0.0,
+  "eta": "optional human ETA or null",
+  "final_report": "optional absolute path or null",
+  "completion_evidence": "short evidence summary",
+  "needs_user_input": false
+}}
+
+規則：
+- 只有你已讀到 final report 或有明確成功證據，才可寫 status=succeeded。
+- 只有你有明確失敗證據，才可寫 status=failed。
+- 仍在跑但未完成，寫 status=watching。
+- 卡住但可補救或需要人手，寫 status=needs_attention。
+- 不要直接修改 task.json；由 gateway 根據 watch_decision.json 套用狀態。
+
+回覆要適合手機閱讀：
+- 第一句直接講人話結論。
+- 最多 3 個短項目。
+- 不要貼 JSON、半截 log、大段 code block、或「使用 Skill」欄位。
+- 不要擴大範圍；這是同一任務的 tick，不是新任務。
+"""
+
+
+def resume_parent_session(parent, reason, evidence, final_report=None, final_status=None, failure_reason=None):
+    parent_id = parent.get("task_id")
+    if not _has_task_session(parent):
+        return False
+    if task_has_codex_process(parent):
+        task_store.append_event(parent_id, "session_resume_suppressed_codex_running", {"reason": reason})
+        return True
+    prompt = build_resume_tick_prompt(parent, reason, evidence, final_report=final_report, final_status=final_status, failure_reason=failure_reason)
+    result = codex_session.resume_session(
+        parent_id,
+        prompt,
+        reason=reason,
+        timeout=int(os.environ.get("CODEX_WATCH_RESUME_TIMEOUT_SECONDS", "900")),
+    )
+    answer = memory_adapter.redact_secrets(result.get("answer") or (result.get("stdout") or "")[-6000:] or "")
+    if not answer:
+        answer = f"Codex resume finished without text output. ok={result.get('ok')} returncode={result.get('returncode')}"
+    task_store.write_task_text(parent_id, "latest_watch_report.md", answer)
+    task_store.append_thread_message(
+        parent_id,
+        "supervisor_thread.jsonl",
+        "assistant",
+        answer,
+        {"source": "session_resume", "reason": reason, "ok": result.get("ok"), "returncode": result.get("returncode")},
+    )
+    task_store.update_goal_state(
+        parent_id,
+        last_progress=answer[:1500],
+        next_action="Continue 10-minute Codex scheduler ticks until final status is confirmed.",
+        needs_user_input=False,
+    )
+    if final_report:
+        safe = answer
+        task_store.write_task_text(parent_id, "result.md", safe)
+        task_store.update_task(
+            parent_id,
+            status=final_status or "succeeded",
+            error=failure_reason if final_status == "failed" else None,
+            supervisor_completed_at=task_store.utc_now(),
+        )
+        codex_session.mark_task_session_finished(parent_id, final_status or "succeeded", reason="session_resume_finalized")
+        task_store.update_goal_state(
+            parent_id,
+            status=final_status or "succeeded",
+            completion_evidence=safe[:2000],
+            needs_user_input=False,
+        )
+        task_store.append_thread_message(parent_id, "thread.jsonl", "assistant", safe, {"source": "session_resume_finalized"})
+        task_store.append_event(
+            parent_id,
+            "session_resume_finalized",
+            {"final_report": final_report, "final_status": final_status, "failure_reason": failure_reason},
+        )
+        released = task_store.release_resource_locks_for_task(parent_id, reason="session_resume_finalized")
+        if released:
+            task_store.append_event(parent_id, "resource_locks_released", {"resource_keys": released})
+        if parent.get("unit_name") and unit_active(parent.get("unit_name")):
+            if stop_task_unit(parent):
+                task_store.append_event(parent_id, "task_unit_stopped_after_session_resume_finalized", {"unit_name": parent.get("unit_name")})
+        if final_status == "failed":
+            append_main_recent(parent, f"任務已失敗：{parent.get('title')}\ntask_id：{parent_id}\nfinal_report：{final_report}\nfailure_reason：{failure_reason}")
+        else:
+            append_main_recent(parent, f"任務已完成：{parent.get('title')}\ntask_id：{parent_id}\nfinal_report：{final_report}")
+    else:
+        task_store.append_event(parent_id, "session_resume_watch_report", {"reason": reason, "ok": result.get("ok")})
+        apply_codex_watch_decision(parent, answer, reason)
+    if parent.get("chat_id"):
+        telegram_sender.send_message(parent.get("chat_id"), answer)
+    return True
+
+
+def apply_codex_watch_decision(parent, answer, reason):
+    parent_id = parent.get("task_id")
+    decision = task_store.read_task_json(parent_id, "watch_decision.json", default={}) or {}
+    if not isinstance(decision, dict) or not decision.get("status"):
+        return None
+    status = str(decision.get("status") or "").strip().lower()
+    if status not in {"watching", "needs_attention", "succeeded", "failed"}:
+        task_store.append_event(parent_id, "codex_watch_decision_ignored", {"reason": reason, "decision": decision})
+        return None
+
+    safe_answer = memory_adapter.redact_secrets(answer or "")
+    task_store.append_event(parent_id, "codex_watch_decision_applied", {"reason": reason, "decision": decision})
+    task_store.update_goal_state(
+        parent_id,
+        status=status,
+        last_progress=decision.get("completion_evidence") or safe_answer[:1500],
+        next_action=decision.get("reason"),
+        needs_user_input=bool(decision.get("needs_user_input")),
+        completion_evidence=(decision.get("completion_evidence") or safe_answer[:2000]) if status in {"succeeded", "failed"} else None,
+    )
+
+    if status in {"watching", "needs_attention"}:
+        task_store.update_task(
+            parent_id,
+            status=status,
+            error=decision.get("reason") if status == "needs_attention" else None,
+            last_codex_watch_decision_at=task_store.utc_now(),
+        )
+        return decision
+
+    task_store.write_task_text(parent_id, "result.md", safe_answer)
+    task_store.update_task(
+        parent_id,
+        status=status,
+        error=decision.get("reason") if status == "failed" else None,
+        supervisor_completed_at=task_store.utc_now(),
+        final_report=decision.get("final_report"),
+    )
+    codex_session.mark_task_session_finished(parent_id, status, reason="codex_watch_decision")
+    task_store.append_thread_message(parent_id, "thread.jsonl", "assistant", safe_answer, {"source": "codex_watch_decision", "status": status})
+    released = task_store.release_resource_locks_for_task(parent_id, reason="codex_watch_decision")
+    if released:
+        task_store.append_event(parent_id, "resource_locks_released", {"resource_keys": released})
+    if parent.get("unit_name") and unit_active(parent.get("unit_name")):
+        if stop_task_unit(parent):
+            task_store.append_event(parent_id, "task_unit_stopped_after_codex_watch_decision", {"unit_name": parent.get("unit_name")})
+    if status == "failed":
+        append_main_recent(parent, f"任務已失敗：{parent.get('title')}\ntask_id：{parent_id}\nreason：{decision.get('reason')}")
+    else:
+        append_main_recent(parent, f"任務已完成：{parent.get('title')}\ntask_id：{parent_id}\nfinal_report：{decision.get('final_report')}")
+    return decision
+
+
 def spawn_supervision_task(parent, reason, evidence):
     parent_id = parent.get("task_id")
     existing = active_child_task(parent_id, reasons={reason})
@@ -559,6 +763,16 @@ def spawn_supervision_task(parent, reason, evidence):
             {"child_task_id": existing.get("task_id"), "reason": reason},
         )
         return existing.get("task_id")
+    if _has_task_session(parent):
+        allowed, state = can_spawn_supervision(parent_id, reason)
+        if not allowed:
+            task_store.append_event(parent_id, "session_resume_supervision_suppressed", {"reason": reason})
+            write_supervision_state(parent_id, state)
+            return None
+        write_supervision_state(parent_id, state)
+        task_store.update_task(parent_id, status="needs_attention" if reason != "periodic_codex_watch" else parent.get("status"))
+        if resume_parent_session(parent, reason, evidence):
+            return parent_id
     allowed, state = can_spawn_supervision(parent_id, reason)
     if not allowed:
         task_store.append_event(parent_id, "supervision_suppressed", {"reason": reason})
@@ -612,6 +826,13 @@ reason={reason}
 
 def spawn_periodic_watch_task(parent, reason, evidence):
     parent_id = parent.get("task_id")
+    if _has_task_session(parent):
+        allowed, state = can_spawn_periodic_watch(parent_id)
+        if not allowed:
+            return None
+        write_supervision_state(parent_id, state)
+        if resume_parent_session(parent, reason, evidence):
+            return parent_id
     existing = active_child_task(parent_id, reasons={"periodic_codex_watch", "final_report_detected"})
     if existing:
         task_store.append_event(
@@ -624,7 +845,7 @@ def spawn_periodic_watch_task(parent, reason, evidence):
     if not allowed:
         return None
 
-    user_text = f"""你是 Codex Telegram Gateway 的定期 watcher。Python supervisor 只負責每 5 分鐘喚醒你；真正的工程判斷由你做。
+    user_text = f"""你是 Codex Telegram Gateway 的定期 watcher。Python supervisor 只負責每 10 分鐘喚醒你；真正的工程判斷由你做。
 
 父 task 未完成，需要你巡檢：
 task_id={parent_id}
@@ -632,7 +853,7 @@ title={parent.get('title')}
 status={parent.get('status')}
 reason={reason}
 
-機械證據：
+排程資訊：
 {evidence}
 
 請只巡檢這個父 task，不要做無關工作。
@@ -683,7 +904,13 @@ def append_main_recent(task, text):
     try:
         import gateway
 
-        gateway.append_recent("assistant", text, task.get("chat_id"), task.get("user_id"))
+        gateway.append_recent(
+            "assistant",
+            text,
+            task.get("chat_id"),
+            task.get("user_id"),
+            metadata={"source": "supervisor", "task_id": task.get("task_id")},
+        )
     except Exception as exc:
         task_store.append_event(task.get("task_id"), "main_recent_append_failed", {"error": f"{type(exc).__name__}: {exc}"})
 
@@ -725,16 +952,80 @@ def build_watched_completion_message(task, report_path, report_tail, final_statu
     return first + "\n" + scope + "\n\n" + "\n".join(f"- {point}" for point in points)
 
 
+def build_watch_progress_message(task, watch, progress, pid, freshest_age, final_report):
+    title = task.get("title") or "background task"
+    if isinstance(progress, dict) and progress.get("available"):
+        summary = progress.get("summary")
+        if not summary:
+            completed = progress.get("completed")
+            total = progress.get("total")
+            percent = progress.get("percent")
+            if completed is not None and total is not None:
+                summary = f"{completed}/{total}"
+                if percent is not None:
+                    summary += f" ({float(percent):.1f}%)"
+        stage = progress.get("stage") or "unknown"
+        updated_at = progress.get("updated_at") or "unknown"
+        first = f"巡檢報告：任務正在正常推進，進度 {summary or '可讀進度不足'}。"
+        points = [
+            f"階段：{stage}｜progress 更新：{updated_at}",
+            f"runner：PID {pid} 存活｜最新 heartbeat/log 約 {format_duration(freshest_age) or '0m'} 前更新",
+            f"final report：{'已產生' if file_nonempty(final_report) else '尚未產生'}",
+        ]
+    else:
+        first = "巡檢報告：runner 存活且 heartbeat/log 新鮮，但 progress 檔目前沒有可讀百分比。"
+        points = [
+            f"任務：{title}",
+            f"runner：PID {pid} 存活｜最新 heartbeat/log 約 {format_duration(freshest_age) or '0m'} 前更新",
+            f"final report：{'已產生' if file_nonempty(final_report) else '尚未產生'}",
+        ]
+    return first + "\n\n" + "\n".join(f"- {point}" for point in points)
+
+
+def publish_watch_progress_report(task, watch, progress, pid, freshest_age, final_report):
+    task_id = task.get("task_id")
+    text = build_watch_progress_message(task, watch, progress, pid, freshest_age, final_report)
+    safe = memory_adapter.redact_secrets(text)
+    task_store.write_task_text(task_id, "latest_watch_report.md", safe)
+    task_store.append_thread_message(task_id, "supervisor_thread.jsonl", "supervisor", safe, {"source": "watch_progress_report"})
+    if task.get("chat_id"):
+        telegram_sender.send_message(task.get("chat_id"), safe)
+    task_store.append_event(task_id, "watch_progress_report_sent", {"progress": progress})
+
+
 def finalize_watched_task(task, watch):
     task_id = task["task_id"]
     report_path = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
     report_tail = read_text_tail(report_path, limit=5000)
     report_status, failure_reason = parse_final_report_status(report_tail)
     final_status = "failed" if report_status == "failed" else "succeeded"
+    if _has_task_session(task):
+        evidence = json.dumps(
+            {
+                "final_report": report_path,
+                "report_status": report_status,
+                "final_status": final_status,
+                "failure_reason": failure_reason,
+                "report_tail": report_tail[-3000:],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        if resume_parent_session(
+            task,
+            "final_report_detected",
+            evidence,
+            final_report=report_path,
+            final_status=final_status,
+            failure_reason=failure_reason,
+        ):
+            return
     text = build_watched_completion_message(task, report_path, report_tail, final_status, failure_reason)
     safe = memory_adapter.redact_secrets(text)
     task_store.write_task_text(task_id, "result.md", safe)
     task_store.update_task(task_id, status=final_status, error=failure_reason if final_status == "failed" else None, supervisor_completed_at=task_store.utc_now())
+    if _has_task_session(task):
+        codex_session.mark_task_session_finished(task_id, final_status, reason="supervisor_finalized")
     task_store.append_thread_message(task_id, "thread.jsonl", "assistant", safe, {"source": "supervisor_finalized"})
     task_store.append_event(task_id, "supervisor_finalized", {"final_report": report_path, "final_status": final_status, "failure_reason": failure_reason})
     released = task_store.release_resource_locks_for_task(task_id, reason="supervisor_finalized")
@@ -765,98 +1056,26 @@ def inspect_watch(task):
     if not isinstance(watch, dict) or not watch.get("enabled", False):
         return
 
-    lock_ok, lock, owner = task_store.acquire_resource_lock(task, watch)
-    if not lock_ok:
-        evidence = json.dumps(
-            {
-                "blocked_task_id": task_id,
-                "blocked_title": task.get("title"),
-                "resource_key": (lock or {}).get("resource_key"),
-                "owner_task_id": owner.get("task_id") if owner else None,
-                "owner_title": owner.get("title") if owner else None,
-                "owner_status": owner.get("status") if owner else None,
-                "lock": lock,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        task_store.update_task(task_id, status="blocked_by_resource", error="resource is locked by another active task")
-        task_store.append_event(task_id, "resource_lock_blocked", {"lock": lock, "owner_task_id": owner.get("task_id") if owner else None})
-        spawn_supervision_task(task, "resource_conflict", evidence)
-        return
-    if lock:
-        watch["resource_key"] = lock.get("resource_key")
-        watch["lock_file"] = lock.get("lock_file")
-        task_store.write_task_json(task_id, "watch.json", watch)
-
-    final_report = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
-    if file_nonempty(final_report):
-        finalize_watched_task(task, watch)
-        return
-
-    pid = pid_from_watch(watch)
-    alive = pid_alive(pid)
-    paths = [
-        watch.get("progress_file"),
-        watch.get("heartbeat_file"),
-        watch.get("log_file"),
-        watch.get("stderr_file"),
-        watch.get("stdout_file"),
-    ]
-    snapshots = [snapshot for snapshot in (file_snapshot(path) for path in paths) if snapshot is not None]
-    ages = [age for age in (file_age(path) for path in paths) if age is not None]
-    freshest_age = min(ages) if ages else None
-    stale_after = int(watch.get("stale_after_seconds") or WATCH_STALE_SECONDS)
-    fresh = freshest_age is not None and freshest_age <= stale_after
-
     state = supervision_state(task_id)
     state["last_watch_check_at"] = task_store.utc_now()
-    state["pid"] = pid
-    state["pid_alive"] = alive
-    state["freshest_file_age_seconds"] = round(freshest_age, 2) if freshest_age is not None else None
-    previous_snapshots = state.get("watch_file_snapshots") if isinstance(state.get("watch_file_snapshots"), list) else []
-    state["watch_files_changed"] = snapshots != previous_snapshots
-    state["watch_file_snapshots"] = snapshots
-    progress = progress_metrics(watch, state)
-    state["progress"] = progress
+    state["mode"] = "codex_scheduler_only"
     write_supervision_state(task_id, state)
-
-    if alive and fresh:
-        if age_seconds(task.get("updated_at")) > min(stale_after, 300):
-            task_store.update_task(task_id, status="watching", error=None)
-        evidence = json.dumps(
-            {
-                "pid": pid,
-                "pid_alive": alive,
-                "freshest_file_age_seconds": round(freshest_age, 2) if freshest_age is not None else None,
-                "stale_after_seconds": stale_after,
-                "final_report_exists": file_nonempty(final_report),
-                "progress": progress,
-                "watch_files_changed": state["watch_files_changed"],
-                "watch": watch,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        task_store.append_event(task_id, "watch_progress_fresh", json.loads(evidence))
-        return
 
     evidence = json.dumps(
         {
-            "pid": pid,
-            "pid_alive": alive,
-            "freshest_file_age_seconds": round(freshest_age, 2) if freshest_age is not None else None,
-            "stale_after_seconds": stale_after,
-            "final_report_exists": file_nonempty(final_report),
-            "progress": progress,
-            "watch_files_changed": state.get("watch_files_changed"),
+            "scheduler": "codex_only",
+            "interval_seconds": CODEX_WATCHER_INTERVAL_SECONDS,
+            "instruction": "Python did not inspect PID, heartbeat, progress, final_report, or resource lock. Codex must read task files and decide.",
+            "task_id": task_id,
+            "title": task.get("title"),
+            "status": task.get("status"),
             "watch": watch,
         },
         ensure_ascii=False,
         indent=2,
     )
-    reason = "watch_pid_dead" if not alive else "watch_stale"
-    spawn_supervision_task(task, reason, evidence)
+    task_store.append_event(task_id, "codex_watch_scheduler_tick", {"interval_seconds": CODEX_WATCHER_INTERVAL_SECONDS})
+    spawn_periodic_watch_task(task, "periodic_codex_watch", evidence)
 
 
 def inspect_active_task(task):
