@@ -190,7 +190,7 @@ def call_codex(prompt):
             "--model",
             MODEL,
             "-c",
-            f'reasoning_effort="{REASONING_EFFORT}"',
+            f'model_reasoning_effort="{REASONING_EFFORT}"',
             "--output-last-message",
             out_path,
             prompt,
