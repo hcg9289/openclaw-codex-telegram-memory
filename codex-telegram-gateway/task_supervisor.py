@@ -525,14 +525,16 @@ def can_spawn_supervision(task_id, reason):
     return True, state
 
 
-def can_spawn_periodic_watch(task_id):
+def can_spawn_periodic_watch(task_id, interval_seconds=None):
     state = supervision_state(task_id)
+    interval = int(interval_seconds or CODEX_WATCHER_INTERVAL_SECONDS)
     now = time.time()
     last_ts = float(state.get("last_codex_watch_spawn_ts") or 0)
-    if now - last_ts < CODEX_WATCHER_INTERVAL_SECONDS:
+    if now - last_ts < interval:
         return False, state
     state["last_codex_watch_spawn_ts"] = now
     state["codex_watch_count"] = int(state.get("codex_watch_count") or 0) + 1
+    state["codex_watch_interval_seconds"] = interval
     return True, state
 
 
@@ -826,8 +828,11 @@ reason={reason}
 
 def spawn_periodic_watch_task(parent, reason, evidence):
     parent_id = parent.get("task_id")
+    watch = task_store.read_task_json(parent_id, "watch.json", default={}) or {}
+    interval_seconds = int(watch.get("codex_watch_interval_seconds") or CODEX_WATCHER_INTERVAL_SECONDS)
+    interval_minutes = max(1, round(interval_seconds / 60))
     if _has_task_session(parent):
-        allowed, state = can_spawn_periodic_watch(parent_id)
+        allowed, state = can_spawn_periodic_watch(parent_id, interval_seconds)
         if not allowed:
             return None
         write_supervision_state(parent_id, state)
@@ -841,11 +846,11 @@ def spawn_periodic_watch_task(parent, reason, evidence):
             {"child_task_id": existing.get("task_id"), "reason": existing.get("supervisor_reason")},
         )
         return existing.get("task_id")
-    allowed, state = can_spawn_periodic_watch(parent_id)
+    allowed, state = can_spawn_periodic_watch(parent_id, interval_seconds)
     if not allowed:
         return None
 
-    user_text = f"""你是 Codex Telegram Gateway 的定期 watcher。Python supervisor 只負責每 10 分鐘喚醒你；真正的工程判斷由你做。
+    user_text = f"""你是 Codex Telegram Gateway 的定期 watcher。Python supervisor 只負責每 {interval_minutes} 分鐘喚醒你；真正的工程判斷由你做。
 
 父 task 未完成，需要你巡檢：
 task_id={parent_id}
@@ -1050,21 +1055,103 @@ def finalize_inferred_task(task, report_path, detector=None):
     finalize_watched_task(task, watch)
 
 
+def run_python_watch_file(task, watch, state):
+    task_id = task["task_id"]
+    script = watch.get("python_watch_file")
+    if not script:
+        return False
+    script_path = Path(str(script))
+    if not script_path.is_file():
+        task_store.append_event(task_id, "python_watch_file_missing", {"python_watch_file": str(script_path)})
+        return False
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), task_id],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=int(watch.get("python_watch_timeout_seconds") or 60),
+        check=False,
+    )
+    state["last_python_watch_ts"] = time.time()
+    state["last_python_watch_at"] = task_store.utc_now()
+    state["last_python_watch_returncode"] = result.returncode
+    write_supervision_state(task_id, state)
+    task_store.append_event(
+        task_id,
+        "python_watch_file_ran",
+        {
+            "python_watch_file": str(script_path),
+            "returncode": result.returncode,
+            "stdout_tail": (result.stdout or "")[-1000:],
+            "stderr_tail": (result.stderr or "")[-1000:],
+        },
+    )
+    return result.returncode == 0
+
+
+def freshest_watch_age(watch):
+    ages = []
+    for key in ("progress_file", "heartbeat_file", "log_file", "stderr_file"):
+        age = file_age(watch.get(key))
+        if age is not None:
+            ages.append(age)
+    return min(ages) if ages else None
+
+
 def inspect_watch(task):
     task_id = task["task_id"]
     watch = task_store.read_task_json(task_id, "watch.json", default={}) or {}
     if not isinstance(watch, dict) or not watch.get("enabled", False):
         return
 
+    final_report = watch.get("final_report") or watch.get("final_report_path") or watch.get("report_path")
+    if file_nonempty(final_report):
+        finalize_watched_task(task, watch)
+        return
+
     state = supervision_state(task_id)
     state["last_watch_check_at"] = task_store.utc_now()
-    state["mode"] = "codex_scheduler_only"
+    state["mode"] = "python_watch_file" if watch.get("python_watch_file") else "codex_scheduler_only"
     write_supervision_state(task_id, state)
+
+    if watch.get("python_watch_file"):
+        stale_after = int(watch.get("stale_after_seconds") or WATCH_STALE_SECONDS)
+        pid = pid_from_watch(watch)
+        runner_alive = pid_alive(pid)
+        fresh_age = freshest_watch_age(watch)
+        if not runner_alive or fresh_age is None or fresh_age > stale_after:
+            evidence = json.dumps(
+                {
+                    "scheduler": "python_watch_file",
+                    "issue": "runner_missing_or_stale",
+                    "task_id": task_id,
+                    "title": task.get("title"),
+                    "pid": pid,
+                    "pid_alive": runner_alive,
+                    "freshest_age_seconds": fresh_age,
+                    "stale_after_seconds": stale_after,
+                    "watch": watch,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            task_store.append_event(task_id, "python_watch_detected_stale_or_dead_runner", {"pid": pid, "freshest_age_seconds": fresh_age})
+            spawn_periodic_watch_task(task, "python_watch_detected_stale_or_dead_runner", evidence)
+            return
+
+        interval = int(watch.get("python_watch_interval_seconds") or CODEX_WATCHER_INTERVAL_SECONDS)
+        last = float(state.get("last_python_watch_ts") or 0)
+        if time.time() - last < interval:
+            return
+        if run_python_watch_file(task, watch, state):
+            return
 
     evidence = json.dumps(
         {
             "scheduler": "codex_only",
-            "interval_seconds": CODEX_WATCHER_INTERVAL_SECONDS,
+            "interval_seconds": int(watch.get("codex_watch_interval_seconds") or CODEX_WATCHER_INTERVAL_SECONDS),
             "instruction": "Python did not inspect PID, heartbeat, progress, final_report, or resource lock. Codex must read task files and decide.",
             "task_id": task_id,
             "title": task.get("title"),
@@ -1074,7 +1161,7 @@ def inspect_watch(task):
         ensure_ascii=False,
         indent=2,
     )
-    task_store.append_event(task_id, "codex_watch_scheduler_tick", {"interval_seconds": CODEX_WATCHER_INTERVAL_SECONDS})
+    task_store.append_event(task_id, "codex_watch_scheduler_tick", {"interval_seconds": int(watch.get("codex_watch_interval_seconds") or CODEX_WATCHER_INTERVAL_SECONDS)})
     spawn_periodic_watch_task(task, "periodic_codex_watch", evidence)
 
 
