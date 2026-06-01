@@ -34,6 +34,15 @@ install -o root -g root -m 640 "$REPO_DIR/openclaw-memory/docker-compose.yml" /o
 find "$REPO_DIR/deploy/systemd" -maxdepth 1 -type f \( -name '*.service' -o -name '*.timer' \) -print0 \
   | xargs -0 -I{} install -o root -g root -m 644 "{}" /etc/systemd/system/
 
+if [ -f "$REPO_DIR/root/AGENTS.md" ]; then
+  if [ -f /root/AGENTS.md ] && ! cmp -s "$REPO_DIR/root/AGENTS.md" /root/AGENTS.md; then
+    backup="/root/AGENTS.md.backup-$(date -u +%Y%m%dT%H%M%SZ)"
+    install -o root -g root -m 640 /root/AGENTS.md "$backup"
+    echo "Backed up existing /root/AGENTS.md to $backup"
+  fi
+  install -o root -g root -m 640 "$REPO_DIR/root/AGENTS.md" /root/AGENTS.md
+fi
+
 if [ ! -f /opt/codex-telegram-gateway/.env ]; then
   install -o root -g root -m 600 "$REPO_DIR/codex-telegram-gateway/.env.example" /opt/codex-telegram-gateway/.env
   echo "Created /opt/codex-telegram-gateway/.env from example. Edit it before starting gateway."

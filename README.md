@@ -29,7 +29,10 @@ recent 20 turns
 /opt/openclaw-memory
 /var/lib/codex-telegram-gateway
 /etc/systemd/system
+/root/AGENTS.md
 ```
+
+`root/AGENTS.md` 是 Codex 的全局行為規則模板，安裝時會同步到 `/root/AGENTS.md`。若目標 VPS 已有不同版本，安裝腳本會先建立 UTC 時間戳備份。
 
 ## 不在 repo 內的內容
 
