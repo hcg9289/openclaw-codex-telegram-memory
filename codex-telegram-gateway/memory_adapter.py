@@ -16,7 +16,7 @@ from pathlib import Path
 
 MEMORY_ENV_PATH = Path(os.environ.get("MEMORY_ENV_PATH", "/opt/openclaw-memory/config/memory.env"))
 COGNEE_PYTHON = os.environ.get("COGNEE_PYTHON", "/opt/openclaw-memory/venv/bin/python")
-DATASET = os.environ.get("COGNEE_DATASET", "openclaw_memory")
+DEFAULT_DATASET = "openclaw_memory"
 DEFAULT_TIMEOUT = int(os.environ.get("COGNEE_TIMEOUT_SECONDS", "45"))
 RECALL_TOP_K = int(os.environ.get("COGNEE_RECALL_TOP_K", "5"))
 LOCK_PATH = Path(os.environ.get("COGNEE_WORKER_LOCK_PATH", "/var/lib/codex-telegram-gateway/memory/cognee_worker.lock"))
@@ -59,6 +59,20 @@ def load_env_file(path=MEMORY_ENV_PATH):
         value = value.strip().strip('"').strip("'")
         data[key] = value
     return data
+
+
+def env_value(key, default=None):
+    return os.environ.get(key) or load_env_file().get(key) or default
+
+
+def write_dataset():
+    return env_value("COGNEE_WRITE_DATASET", env_value("COGNEE_DATASET", DEFAULT_DATASET))
+
+
+def recall_datasets():
+    raw = env_value("COGNEE_RECALL_DATASETS", write_dataset())
+    values = [item.strip() for item in str(raw or "").split(",") if item.strip()]
+    return values or [write_dataset()]
 
 
 @contextlib.contextmanager
@@ -112,7 +126,7 @@ def recall_memory(query, session_id=None, top_k=RECALL_TOP_K, timeout=DEFAULT_TI
     safe_query = redact_secrets(query)
     if not safe_query.strip():
         return {"ok": True, "items": [], "text": ""}
-    payload = {"query": safe_query, "top_k": top_k, "dataset": DATASET}
+    payload = {"query": safe_query, "top_k": top_k, "datasets": recall_datasets()}
     return _run_worker("recall", payload, timeout=timeout)
 
 
@@ -122,7 +136,7 @@ def remember_fact(text, metadata=None, session_id=None, timeout=120):
     payload = {
         "text": redact_secrets(text),
         "metadata": metadata or {},
-        "dataset": DATASET,
+        "dataset": write_dataset(),
     }
     return _run_worker("remember", payload, timeout=timeout)
 
@@ -134,7 +148,8 @@ def memory_status():
         "memory_env_exists": MEMORY_ENV_PATH.exists(),
         "cognee_python": COGNEE_PYTHON,
         "cognee_python_exists": Path(COGNEE_PYTHON).exists(),
-        "dataset": DATASET,
+        "dataset": write_dataset(),
+        "recall_datasets": recall_datasets(),
         "llm_model": env.get("LLM_MODEL"),
         "llm_endpoint": env.get("LLM_ENDPOINT"),
         "embedding_model": env.get("EMBEDDING_MODEL"),
@@ -186,7 +201,7 @@ async def _worker_recall(payload):
     results = await cognee.search(
         query_text=payload["query"],
         query_type=SearchType.CHUNKS,
-        datasets=[payload.get("dataset") or DATASET],
+        datasets=payload.get("datasets") or [payload.get("dataset") or write_dataset()],
         top_k=int(payload.get("top_k") or RECALL_TOP_K),
     )
     items = [str(item) for item in results]
@@ -202,7 +217,7 @@ async def _worker_remember(payload):
     data = f"{header}\n\n{payload['text']}".strip()
     result = await cognee.remember(
         data,
-        dataset_name=payload.get("dataset") or DATASET,
+        dataset_name=payload.get("dataset") or write_dataset(),
         run_in_background=False,
     )
     return {"ok": True, "result": str(result)}
