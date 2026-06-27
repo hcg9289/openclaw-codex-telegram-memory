@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import hashlib
 import os
 import signal
 import socket
@@ -41,6 +42,14 @@ MAX_MESSAGE = 3900
 MAX_RECENT_TURNS = int(os.environ.get("MAX_RECENT_TURNS", "20"))
 MAX_ACTIVE_WORK_TASKS = int(os.environ.get("MAX_ACTIVE_WORK_TASKS", "2"))
 MESSAGE_BATCH_DELAY_SECONDS = float(os.environ.get("MESSAGE_BATCH_DELAY_SECONDS", "8"))
+DOCUMENT_BATCH_DELAY_SECONDS = float(os.environ.get("DOCUMENT_BATCH_DELAY_SECONDS", "45"))
+MAX_TELEGRAM_DOCUMENT_BYTES = int(os.environ.get("MAX_TELEGRAM_DOCUMENT_BYTES", str(50 * 1024 * 1024)))
+TELEGRAM_DOCUMENT_RETRIES = int(os.environ.get("TELEGRAM_DOCUMENT_RETRIES", "5"))
+TELEGRAM_GETFILE_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_GETFILE_TIMEOUT_SECONDS", "45"))
+TELEGRAM_DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS", "300"))
+TELEGRAM_DOCUMENT_RETRY_BACKOFF_SECONDS = float(os.environ.get("TELEGRAM_DOCUMENT_RETRY_BACKOFF_SECONDS", "2"))
+INCOMING_ATTACHMENTS_DIR = STATE_DIR / "incoming_attachments"
+ATTACHMENT_FAILURE_LOG = STATE_DIR / "attachment_download_failures.jsonl"
 STOP = False
 
 
@@ -62,6 +71,196 @@ def api_call(method, data=None, timeout=35):
     if not parsed.get("ok"):
         raise RuntimeError(f"Telegram API error on {method}: {parsed}")
     return parsed["result"]
+
+
+def safe_attachment_filename(value, fallback="telegram_document"):
+    raw = Path(str(value or fallback)).name.strip()
+    if not raw:
+        raw = fallback
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    safe = safe.strip("._") or fallback
+    return safe[:160]
+
+
+def attachment_file_id_hash(file_id):
+    return hashlib.sha256(str(file_id or "").encode("utf-8")).hexdigest()[:16]
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def select_largest_telegram_photo(photos):
+    candidates = [item for item in photos or [] if isinstance(item, dict) and item.get("file_id")]
+    if not candidates:
+        return None
+
+    def score(item):
+        width = safe_int(item.get("width"))
+        height = safe_int(item.get("height"))
+        return (safe_int(item.get("file_size")), width * height, width, height)
+
+    return max(candidates, key=score)
+
+
+def is_retryable_telegram_download_error(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code <= 599
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def retry_telegram_document_operation(phase, operation):
+    attempts = max(1, TELEGRAM_DOCUMENT_RETRIES)
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation(attempt)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not is_retryable_telegram_download_error(exc):
+                raise
+            delay = min(30.0, TELEGRAM_DOCUMENT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            print(
+                f"telegram document {phase} failed: "
+                f"attempt={attempt}/{attempts} error={type(exc).__name__}; retrying in {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+def log_attachment_download_failure(message, document, phase, attempts, exc):
+    _jsonl_append(
+        ATTACHMENT_FAILURE_LOG,
+        {
+            "at": task_store.utc_now(),
+            "phase": phase,
+            "attempts": attempts,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "message_id": message.get("message_id"),
+            "chat_id": message.get("chat", {}).get("id"),
+            "user_id": message.get("from", {}).get("id"),
+            "original_filename": document.get("file_name"),
+            "mime_type": document.get("mime_type"),
+            "declared_file_size": document.get("file_size"),
+            "telegram_file_unique_id": document.get("file_unique_id"),
+            "telegram_file_id_hash": attachment_file_id_hash(document.get("file_id")),
+        },
+    )
+
+
+def download_telegram_document(message, document, chat_id, user_id):
+    file_id = document.get("file_id")
+    if not file_id:
+        raise ValueError("Telegram document has no file_id")
+    declared_size = int(document.get("file_size") or 0)
+    if declared_size and declared_size > MAX_TELEGRAM_DOCUMENT_BYTES:
+        raise ValueError(f"Telegram document too large: {declared_size} bytes")
+
+    try:
+        file_info = retry_telegram_document_operation(
+            "getFile",
+            lambda _attempt: api_call(
+                "getFile",
+                {"file_id": file_id},
+                timeout=TELEGRAM_GETFILE_TIMEOUT_SECONDS,
+            ),
+        )
+    except Exception as exc:
+        log_attachment_download_failure(message, document, "getFile", max(1, TELEGRAM_DOCUMENT_RETRIES), exc)
+        raise
+    file_path = file_info.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram getFile returned no file_path")
+
+    batch_dir = INCOMING_ATTACHMENTS_DIR / task_store.safe_name(_pending_batch_key(chat_id, user_id))
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    original_name = document.get("file_name") or f"{document.get('file_unique_id') or message.get('message_id')}.bin"
+    safe_name = safe_attachment_filename(original_name)
+    message_id = message.get("message_id") or int(time.time())
+    destination = batch_dir / f"{message_id}_{safe_name}"
+    if destination.exists():
+        destination = batch_dir / f"{message_id}_{int(time.time())}_{safe_name}"
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+
+    def download_once(_attempt):
+        total = 0
+        try:
+            with urllib.request.urlopen(
+                url,
+                timeout=TELEGRAM_DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS,
+            ) as response, tmp.open("wb") as file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_TELEGRAM_DOCUMENT_BYTES:
+                        raise ValueError(f"Telegram document too large while downloading: {total} bytes")
+                    file.write(chunk)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return total
+
+    try:
+        total = retry_telegram_document_operation("download", download_once)
+        os.replace(tmp, destination)
+        os.chmod(destination, 0o600)
+    except Exception as exc:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        log_attachment_download_failure(
+            message,
+            document,
+            "download",
+            max(1, TELEGRAM_DOCUMENT_RETRIES),
+            exc,
+        )
+        raise
+
+    return {
+        "kind": "telegram_document",
+        "original_filename": str(original_name),
+        "mime_type": document.get("mime_type"),
+        "file_size": declared_size or total,
+        "telegram_file_unique_id": document.get("file_unique_id"),
+        "message_id": message.get("message_id"),
+        "downloaded_path": str(destination),
+        "received_at": task_store.utc_now(),
+    }
+
+
+def download_telegram_photo(message, photo, chat_id, user_id):
+    message_id = message.get("message_id") or int(time.time())
+    unique_name = safe_attachment_filename(
+        photo.get("file_unique_id") or attachment_file_id_hash(photo.get("file_id")),
+        fallback="image",
+    )
+    document_like = dict(photo)
+    document_like["file_name"] = f"telegram_photo_{message_id}_{unique_name}.jpg"
+    document_like["mime_type"] = "image/jpeg"
+
+    attachment = download_telegram_document(message, document_like, chat_id, user_id)
+    attachment["kind"] = "telegram_photo"
+    attachment["width"] = safe_int(photo.get("width"))
+    attachment["height"] = safe_int(photo.get("height"))
+    return attachment
 
 
 def is_polling_timeout(exc):
@@ -497,17 +696,74 @@ def launch_task(task):
     return False, "queued because max active work tasks reached"
 
 
-def create_and_launch_task_from_text(user_text, chat_id, user_id, batch_count=1):
+def finalize_task_attachments(task_id, attachments):
+    finalized = []
+    target_dir = task_store.task_dir(task_id) / "attachments"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for index, attachment in enumerate(attachments or [], start=1):
+        item = dict(attachment)
+        source = Path(str(item.get("downloaded_path") or ""))
+        safe_name = safe_attachment_filename(item.get("original_filename") or source.name or f"attachment_{index}.bin")
+        destination = target_dir / f"{index:02d}_{safe_name}"
+        if destination.exists():
+            destination = target_dir / f"{index:02d}_{int(time.time())}_{safe_name}"
+        if source.exists():
+            os.replace(source, destination)
+            os.chmod(destination, 0o600)
+            item["path"] = str(destination)
+            item["stored"] = True
+        else:
+            item["path"] = str(destination)
+            item["stored"] = False
+            item["error"] = "downloaded source file missing"
+        item.pop("downloaded_path", None)
+        finalized.append(item)
+    task_store.write_task_json(task_id, "attachments.json", finalized)
+    task_store.append_event(task_id, "attachments_saved", {"count": len(finalized)})
+    return finalized
+
+
+def format_attachment_summary(attachments):
+    if not attachments:
+        return ""
+    lines = ["Telegram attachments saved for this task:"]
+    for index, item in enumerate(attachments, start=1):
+        size = item.get("file_size") or 0
+        lines.append(
+            f"{index}. filename={item.get('original_filename')} path={item.get('path')} "
+            f"mime_type={item.get('mime_type')} size_bytes={size}"
+        )
+    return "\n".join(lines)
+
+
+def create_and_launch_task_from_text(user_text, chat_id, user_id, batch_count=1, attachments=None):
+    attachments = attachments or []
+    if attachments and not str(user_text or "").strip():
+        user_text = "收到 Telegram 附件，請按最近對話目的處理。"
     task = task_store.create_task(user_text, chat_id, user_id)
-    append_recent("user", user_text, chat_id, user_id, metadata={"source": "telegram_task", "task_id": task["task_id"]})
+    final_attachments = finalize_task_attachments(task["task_id"], attachments) if attachments else []
+    attachment_summary = format_attachment_summary(final_attachments)
+    user_text_for_task = user_text
+    if attachment_summary:
+        user_text_for_task = f"{str(user_text or '').strip()}\n\n{attachment_summary}".strip()
+        task = task_store.update_task(task["task_id"], user_text=user_text_for_task, title=task_store.make_title(user_text_for_task))
+        task_store.append_thread_message(
+            task["task_id"],
+            "thread.jsonl",
+            "user",
+            user_text_for_task,
+            {"source": "telegram_task_attachments"},
+        )
+    append_recent("user", user_text_for_task, chat_id, user_id, metadata={"source": "telegram_task", "task_id": task["task_id"]})
     launch_task(task)
     status = (task_store.get_task(task["task_id"]) or task).get("status")
     batch_note = f"\n合併段數：{batch_count}" if batch_count > 1 else ""
+    attachment_note = f"\n附件數：{len(final_attachments)}" if final_attachments else ""
     send_message(
         chat_id,
         f"已建立 background Codex task：{task.get('title')}\n"
         f"task_id：{task.get('task_id')}\n"
-        f"狀態：{status}{batch_note}\n"
+        f"狀態：{status}{batch_note}{attachment_note}\n"
         f"你可以繼續對話；要查進度可直接問，或用 /task <task_id>。",
     )
     return task
@@ -530,21 +786,32 @@ def save_pending_message_batches(batches):
         PENDING_MESSAGE_BATCHES_FILE.unlink()
 
 
-def enqueue_user_task_message(safe_text, chat_id, user_id):
+def enqueue_user_task_message(safe_text, chat_id, user_id, attachments=None, delay_seconds=None):
+    attachments = attachments or []
+    safe_text = str(safe_text or "").strip()
+    if not safe_text and not attachments:
+        return
     now = time.time()
+    delay = float(delay_seconds if delay_seconds is not None else MESSAGE_BATCH_DELAY_SECONDS)
     key = _pending_batch_key(chat_id, user_id)
     batches = load_pending_message_batches()
     batch = batches.get(key) or {
         "chat_id": chat_id,
         "user_id": user_id,
         "segments": [],
+        "attachments": [],
         "created_at": now,
         "last_update_at": now,
-        "deadline": now + MESSAGE_BATCH_DELAY_SECONDS,
+        "deadline": now + delay,
     }
-    batch["segments"].append(safe_text)
+    batch.setdefault("segments", [])
+    batch.setdefault("attachments", [])
+    if safe_text:
+        batch["segments"].append(safe_text)
+    if attachments:
+        batch["attachments"].extend(attachments)
     batch["last_update_at"] = now
-    batch["deadline"] = now + MESSAGE_BATCH_DELAY_SECONDS
+    batch["deadline"] = now + delay
     batches[key] = batch
     save_pending_message_batches(batches)
 
@@ -560,10 +827,17 @@ def flush_due_pending_message_batches(force=False):
             remaining[key] = batch
             continue
         segments = [str(item).strip() for item in batch.get("segments") or [] if str(item).strip()]
-        if not segments:
+        attachments = [item for item in batch.get("attachments") or [] if isinstance(item, dict)]
+        if not segments and not attachments:
             continue
-        user_text = "\n\n".join(segments)
-        create_and_launch_task_from_text(user_text, batch.get("chat_id"), batch.get("user_id"), batch_count=len(segments))
+        user_text = "\n\n".join(segments) if segments else "收到 Telegram 附件，請按最近對話目的處理。"
+        create_and_launch_task_from_text(
+            user_text,
+            batch.get("chat_id"),
+            batch.get("user_id"),
+            batch_count=max(len(segments), 1),
+            attachments=attachments,
+        )
     save_pending_message_batches(remaining)
 
 
@@ -665,11 +939,43 @@ def handle_message(message):
     sender = message.get("from") or {}
     chat_id = chat.get("id")
     user_id = sender.get("id")
-    text = (message.get("text") or "").strip()
+    document = message.get("document")
+    photo = select_largest_telegram_photo(message.get("photo") or [])
+    text = (message.get("text") or message.get("caption") or "").strip()
 
-    if not chat_id or not text:
+    if not chat_id or (not text and not document and not photo):
         return
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        return
+
+    if document or photo:
+        safe_text = memory_adapter.redact_secrets(text)
+        if memory_adapter.contains_secret(text):
+            send_message(chat_id, "偵測到疑似 secret，已遮蔽後處理，且不會寫入長期記憶。")
+        try:
+            if document:
+                attachment = download_telegram_document(message, document, chat_id, user_id)
+                attachment_label = "文件"
+            else:
+                attachment = download_telegram_photo(message, photo, chat_id, user_id)
+                attachment_label = "圖片"
+        except Exception as exc:
+            send_message(chat_id, f"附件接收失敗：{type(exc).__name__}: {exc}")
+            return
+        if not safe_text:
+            safe_text = f"收到 Telegram {attachment_label}：{attachment.get('original_filename')}"
+        enqueue_user_task_message(
+            safe_text,
+            chat_id,
+            user_id,
+            attachments=[attachment],
+            delay_seconds=DOCUMENT_BATCH_DELAY_SECONDS,
+        )
+        send_message(
+            chat_id,
+            f"已收到{attachment_label}：{attachment.get('original_filename')}\n"
+            f"會等約 {int(DOCUMENT_BATCH_DELAY_SECONDS)} 秒合併同一批附件，再建立 Codex task。",
+        )
         return
 
     if text in {"/start", "/help"}:
@@ -677,6 +983,7 @@ def handle_message(message):
             chat_id,
             "Codex Telegram Gateway online.\n\n"
             "普通訊息會建立 background Codex task，並帶入 facts/recent/cognee 記憶。\n"
+            "支援 Telegram document/photo 附件，會下載到 task folder 後交給 Codex 使用。\n"
             "不使用 Orchestrator/子代理；/job-* 只保留用於查詢舊任務紀錄。\n"
             "Commands: /status, /ping, /whoami, /context, /remember <text>, /reset, /memory-status, "
             "/facts, /fact <key>, /setfact <key> = <value>, /setfact-verified <key> = <value>, "

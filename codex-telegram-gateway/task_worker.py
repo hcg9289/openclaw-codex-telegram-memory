@@ -73,6 +73,14 @@ def main():
         task_context = task_store.task_context(referenced["task_id"], limit_chars=12000) if referenced else "(no referenced task context)"
         goal_state = task_store.ensure_goal_state(task_id, task)
         prompt = gateway.build_prompt(user_text, recall_text, recent_context)
+        attachments = task_store.read_task_json(task_id, "attachments.json", default=[]) or []
+        if attachments:
+            prompt += (
+                "\n\n[TELEGRAM_ATTACHMENTS]\n"
+                "The current Telegram message included downloaded attachments. Use these VPS local paths when needed.\n"
+                + json.dumps(attachments, ensure_ascii=False, indent=2)
+                + "\n[/TELEGRAM_ATTACHMENTS]\n"
+            )
         prompt += f"""
 
 [STRICT_SCOPE_RULE]
