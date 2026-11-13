@@ -1,6 +1,7 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    build: .
+    image: openclaw-memory-postgres:16.15-pgvector0.8.2-20261023
     container_name: openclaw-memory-postgres
     restart: unless-stopped
     env_file:

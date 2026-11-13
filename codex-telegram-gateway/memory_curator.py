@@ -123,7 +123,7 @@ def run_codex_curator(prompt):
             "--model",
             os.environ.get("MEMORY_CURATOR_CODEX_MODEL", "gpt-5.5"),
             "-c",
-            'model_reasoning_effort="high"',
+            'model_reasoning_effort="xhigh"',
             "--sandbox",
             "read-only",
             "--ignore-rules",
